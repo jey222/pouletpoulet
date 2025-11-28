@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PeerCord - Discord Clone</title>
+    <!-- Tailwind CSS via CDN is fine for simplicity, though normally built via PostCSS in prod -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- FontAwesome for Discord-like icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- PeerJS CDN is kept to ensure compatibility with existing code logic -->
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+  <script type="importmap">
+{
+  "imports": {
+    "react/": "https://aistudiocdn.com/react@^19.2.0/",
+    "react": "https://aistudiocdn.com/react@^19.2.0",
+    "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.0/",
+    "vite": "https://aistudiocdn.com/vite@^7.2.4",
+    "@vitejs/plugin-react": "https://aistudiocdn.com/@vitejs/plugin-react@^5.1.1"
+  }
+}
+</script>
+<link rel="stylesheet" href="/index.css">
+</head>
+  <body class="bg-[#202225] text-gray-100 antialiased overflow-hidden">
+    <div id="root"></div>
+
+    <!-- Point d'entrée pour Vite -->
+    <script type="module" src="/index.tsx"></script>
+
+    <!-- Système de Sons (Soundboard) -->
+    <audio id="sound-ringtone" loop preload="auto"></audio>
+    <audio id="sound-join" preload="auto"></audio>
+    <audio id="sound-leave" preload="auto"></audio>
+    <audio id="sound-mute" preload="auto"></audio>
+    <audio id="sound-unmute" preload="auto"></audio>
+    <audio id="sound-message" preload="auto"></audio>
+  </body>
+</html>

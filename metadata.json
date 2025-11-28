@@ -1,0 +1,8 @@
+{
+  "name": "PeerCord P2P",
+  "description": "A simplified P2P Discord clone using PeerJS for WebRTC video, audio, and data transfer.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
