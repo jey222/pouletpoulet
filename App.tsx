@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { DataConnection, MediaConnection, PeerInstance, NetworkMessage, LogEntry, ChatMessage, DeviceInfo, RemotePeer, ActivityMessage, DrawLine } from './types';
+import { DataConnection, MediaConnection, PeerInstance, NetworkMessage, LogEntry, ChatMessage, DeviceInfo, RemotePeer, ActivityMessage, DrawLine, QueueItem } from './types';
 
 // --- Assets & Constants ---
 const SOUND_RINGTONE = "/ringtone.mp3"; 
@@ -11,7 +11,11 @@ const SOUND_UI_ON = "https://cdn.pixabay.com/download/audio/2022/03/24/audio_c8c
 const SOUND_UI_OFF = "https://cdn.pixabay.com/download/audio/2022/03/24/audio_1020476839.mp3"; // Click/Off
 const SOUND_ENTER_ROOM = "https://cdn.pixabay.com/download/audio/2022/03/15/audio_762635987a.mp3"; // Space swoosh
 
-const MAX_PEERS_LIMIT = 3; // Absolute hard limit (Host + 3 guests = 4 total)
+const MAX_PEERS_LIMIT = 3; 
+const WB_COLORS = [
+    '#000000', '#57534e', '#ef4444', '#f97316', '#f59e0b', '#84cc16', '#10b981', 
+    '#06b6d4', '#3b82f6', '#6366f1', '#8b5cf6', '#d946ef', '#f43f5e', '#881337'
+];
 
 // --- YouTube API Helper ---
 const loadYouTubeAPI = (callback: () => void) => {
@@ -32,9 +36,24 @@ const getYoutubeId = (url: string) => {
     return (match && match[2].length === 11) ? match[2] : null;
 };
 
+// Fetch real metadata without API Key using oEmbed
+const fetchVideoMeta = async (videoId: string) => {
+    try {
+        const response = await fetch(`https://noembed.com/embed?url=https://www.youtube.com/watch?v=${videoId}`);
+        const data = await response.json();
+        return {
+            title: data.title || "Vidéo YouTube",
+            thumbnail: data.thumbnail_url || `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`
+        };
+    } catch (e) {
+        return { title: "Vidéo YouTube", thumbnail: `https://img.youtube.com/vi/${videoId}/mqdefault.jpg` };
+    }
+};
+
 export default function App() {
   // --- View State ---
   const [viewState, setViewState] = useState<'login' | 'lobby' | 'room'>('login');
+  const [isTransitioning, setIsTransitioning] = useState(false);
 
   // --- Identity ---
   const [username, setUsername] = useState(''); 
@@ -45,13 +64,14 @@ export default function App() {
   
   // --- Room Configuration ---
   const [remoteIdInput, setRemoteIdInput] = useState('');
-  const [roomCapacity, setRoomCapacity] = useState(4); // Default max
+  const [roomCapacity, setRoomCapacity] = useState(4); 
   const [peers, setPeers] = useState<Map<string, RemotePeer>>(new Map());
   const [incomingCall, setIncomingCall] = useState<{ call: MediaConnection, metadata?: any } | null>(null);
+  const [isWaitingForHost, setIsWaitingForHost] = useState(false);
 
   // --- Local Media ---
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
-  const [processedStream, setProcessedStream] = useState<MediaStream | null>(null); // Stream sent to peer (with gain)
+  const [processedStream, setProcessedStream] = useState<MediaStream | null>(null); 
   const [isMuted, setIsMuted] = useState(false);
   const [isDeafened, setIsDeafened] = useState(false);
   const [isVideoEnabled, setIsVideoEnabled] = useState(false);
@@ -71,7 +91,7 @@ export default function App() {
   // --- Context Menu (Volume) ---
   const [contextMenu, setContextMenu] = useState<{ x: number, y: number, peerId: string } | null>(null);
 
-  // --- Refs for State Access in Callbacks ---
+  // --- Refs ---
   const isMutedRef = useRef(isMuted);
   const isDeafenedRef = useRef(isDeafened);
   const isVideoEnabledRef = useRef(isVideoEnabled);
@@ -79,7 +99,7 @@ export default function App() {
   const displayNameRef = useRef(displayName);
   const myActivityRef = useRef(myCurrentActivity);
   const localAvatarRef = useRef<string | null>(null);
-  const peersRef = useRef<Map<string, RemotePeer>>(new Map()); // Mirror state for callbacks
+  const peersRef = useRef<Map<string, RemotePeer>>(new Map());
   const roomCapacityRef = useRef(roomCapacity);
 
   // Sync refs
@@ -93,12 +113,16 @@ export default function App() {
   useEffect(() => { myActivityRef.current = myCurrentActivity; }, [myCurrentActivity]);
 
   // --- UI State ---
-  const [pinnedView, setPinnedView] = useState<'local' | 'activity' | string | null>(null); // 'local', 'activity', or peerId
+  const [pinnedView, setPinnedView] = useState<'local' | 'activity' | string | null>(null); 
   
   // --- Activity State (SHARED & LOCAL) ---
-  const [activityView, setActivityView] = useState<{ type: 'youtube' | 'whiteboard', videoId?: string } | null>(null);
+  const [activityView, setActivityView] = useState<{ type: 'youtube' | 'whiteboard' } | null>(null);
   const [showActivityModal, setShowActivityModal] = useState(false);
+  
+  // YouTube State
   const [youtubeInput, setYoutubeInput] = useState('');
+  const [youtubeQueue, setYoutubeQueue] = useState<QueueItem[]>([]);
+  const [currentVideo, setCurrentVideo] = useState<QueueItem | null>(null);
   
   // Whiteboard State
   const [wbColor, setWbColor] = useState('#000000');
@@ -122,23 +146,32 @@ export default function App() {
 
   // --- Core Refs ---
   const peerRef = useRef<PeerInstance | null>(null);
-  const localVideoRef = useRef<HTMLVideoElement | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
   const chatBottomRef = useRef<HTMLDivElement>(null);
   const mediaUploadRef = useRef<HTMLInputElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   // Audio Processing Refs
   const localAudioCtxRef = useRef<AudioContext | null>(null);
   const gainNodeRef = useRef<GainNode | null>(null);
-  const audioDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(null);
-  const animationFrameRef = useRef<number | null>(null);
   const peerAnalysersRef = useRef<Map<string, AnalyserNode>>(new Map());
 
   // --- Effects ---
   useEffect(() => {
     chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatHistory, showMobileChat]);
+
+  // Whiteboard Page Redraw Effect
+  useEffect(() => {
+      if (activityView?.type === 'whiteboard' && canvasRef.current) {
+          const ctx = canvasRef.current.getContext('2d');
+          if (ctx) {
+              ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+              const history = wbHistoryRef.current.get(wbPageIndex) || [];
+              history.forEach(line => drawOnCanvas(line, canvasRef.current!));
+          }
+      }
+  }, [wbPageIndex, activityView]);
 
   useEffect(() => {
     const handleClick = () => setContextMenu(null);
@@ -162,7 +195,6 @@ export default function App() {
       gainNodeRef.current = gainNode;
 
       const dest = ctx.createMediaStreamDestination();
-      audioDestinationRef.current = dest;
 
       source.connect(gainNode);
       gainNode.connect(dest);
@@ -172,7 +204,6 @@ export default function App() {
       analyser.fftSize = 256;
       gainNode.connect(analyser);
 
-      // Animation Loop for Local Volume
       const dataArray = new Uint8Array(analyser.frequencyBinCount);
       const checkVolume = () => {
           analyser.getByteFrequencyData(dataArray);
@@ -180,7 +211,7 @@ export default function App() {
           for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
           const average = sum / dataArray.length;
           setIsLocalSpeaking(average > 10);
-          animationFrameRef.current = requestAnimationFrame(checkVolume);
+          requestAnimationFrame(checkVolume);
       };
       checkVolume();
 
@@ -201,11 +232,16 @@ export default function App() {
   const changeAudioInput = async (deviceId: string) => {
       setSelectedMicId(deviceId);
       try {
+          if(!localStream) return;
           const newStream = await navigator.mediaDevices.getUserMedia({ 
               audio: { deviceId: { exact: deviceId } },
-              video: isVideoEnabled 
+              video: false
           });
-          if (localStream && localStream.getVideoTracks().length > 0) newStream.addTrack(localStream.getVideoTracks()[0]);
+          
+          if (localStream.getVideoTracks().length > 0) {
+              newStream.addTrack(localStream.getVideoTracks()[0]);
+          }
+
           setLocalStream(newStream);
           const processed = setupAudioGraph(newStream);
           
@@ -222,7 +258,7 @@ export default function App() {
       if (gainNodeRef.current) gainNodeRef.current.gain.value = micGain;
   }, [micGain]);
 
-  // --- ACTIONS (MUTE/DEAFEN/SCREEN) ---
+  // --- ACTIONS ---
   const toggleMute = () => {
     const t = processedStream?.getAudioTracks()[0]; 
     if(t){
@@ -241,11 +277,26 @@ export default function App() {
       broadcastData({type:'status', muted:isMuted, deafened:newState, videoEnabled:isVideoEnabled, isScreenSharing:isScreenSharing, currentActivity:myCurrentActivity});
   };
 
-  const toggleVideo = () => {
-    const t = localStream?.getVideoTracks()[0]; 
-    if(t){
-        t.enabled = !t.enabled; 
-        const newState = !t.enabled;
+  const toggleVideo = async () => {
+    if (!localStream) return;
+    let videoTrack = localStream.getVideoTracks()[0];
+    if (!videoTrack) {
+        try {
+            const videoStream = await navigator.mediaDevices.getUserMedia({ video: true });
+            videoTrack = videoStream.getVideoTracks()[0];
+            localStream.addTrack(videoTrack);
+            if(processedStream) processedStream.addTrack(videoTrack);
+            peersRef.current.forEach(peer => {
+                 if (peer.mediaCall && peer.mediaCall.peerConnection) {
+                     const sender = peer.mediaCall.peerConnection.getSenders().find((s: any) => s.track && s.track.kind === 'video');
+                     if (sender) sender.replaceTrack(videoTrack);
+                 }
+             });
+        } catch (e) { addLog("Caméra refusée ou indisponible", "error"); return; }
+    }
+    if(videoTrack){
+        videoTrack.enabled = !videoTrack.enabled; 
+        const newState = videoTrack.enabled;
         setIsVideoEnabled(newState);
         playSound(newState ? SOUND_UI_ON : SOUND_UI_OFF); 
         broadcastData({type:'status', videoEnabled:newState, muted:isMuted, deafened:isDeafened, isScreenSharing:isScreenSharing, currentActivity:myCurrentActivity});
@@ -254,49 +305,35 @@ export default function App() {
 
   const toggleScreenShare = async () => {
       if (isScreenSharing) {
-          // Stop sharing
           try {
-             // Get webcam back
              const camStream = await navigator.mediaDevices.getUserMedia({ video: selectedCamId ? { deviceId: { exact: selectedCamId } } : true });
              const videoTrack = camStream.getVideoTracks()[0];
-             
-             // Disable if it was disabled before
              if (!isVideoEnabled) videoTrack.enabled = false;
-             
-             // Replace tracks
              if(localStream) {
                  localStream.getVideoTracks().forEach(t => localStream.removeTrack(t));
                  localStream.addTrack(videoTrack);
              }
-             
              peersRef.current.forEach(peer => {
                  if (peer.mediaCall && peer.mediaCall.peerConnection) {
                      const sender = peer.mediaCall.peerConnection.getSenders().find((s: any) => s.track && s.track.kind === 'video');
                      if (sender) sender.replaceTrack(videoTrack);
                  }
              });
-             
              setIsScreenSharing(false);
              playSound(SOUND_UI_OFF);
              broadcastData({type:'status', videoEnabled:isVideoEnabled, muted:isMuted, deafened:isDeafened, isScreenSharing:false, currentActivity:myCurrentActivity});
           } catch(e) { addLog("Erreur arrêt partage", "error"); }
       } else {
-          // Start sharing
           try {
               const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
               const screenTrack = screenStream.getVideoTracks()[0];
-              
-              screenTrack.onended = () => {
-                  if (isScreenSharingRef.current) toggleScreenShare(); // Handle UI stop button
-              };
-
+              screenTrack.onended = () => { if (isScreenSharingRef.current) toggleScreenShare(); };
               peersRef.current.forEach(peer => {
                  if (peer.mediaCall && peer.mediaCall.peerConnection) {
                      const sender = peer.mediaCall.peerConnection.getSenders().find((s: any) => s.track && s.track.kind === 'video');
                      if (sender) sender.replaceTrack(screenTrack);
                  }
              });
-             
              setIsScreenSharing(true);
              playSound(SOUND_UI_ON);
              broadcastData({type:'status', videoEnabled:true, muted:isMuted, deafened:isDeafened, isScreenSharing:true, currentActivity:myCurrentActivity});
@@ -313,7 +350,6 @@ export default function App() {
               id, displayName: 'Connexion...', status: { muted: false, deafened: false, videoEnabled: false, isScreenSharing: false },
               volume: 1, isSpeaking: false, currentActivity: 'none'
           } as RemotePeer;
-          
           newMap.set(id, { ...existing, ...partialPeer });
           return newMap;
       });
@@ -334,6 +370,7 @@ export default function App() {
       setPinnedView(prev => (prev === id ? null : prev));
       playSound(SOUND_LEAVE);
       addLog("Un utilisateur a quitté le salon", "info");
+      setIsWaitingForHost(false);
   };
 
   const broadcastData = (msg: NetworkMessage) => {
@@ -346,26 +383,46 @@ export default function App() {
 
   // --- CONNECTION LOGIC ---
 
+  const startRoomTransition = (capacity: number, mode?: 'cinema') => {
+      setIsTransitioning(true);
+      playSound(SOUND_ENTER_ROOM);
+      setTimeout(() => {
+          setRoomCapacity(capacity);
+          setViewState('room');
+          if(mode === 'cinema') {
+              setTimeout(() => startYoutubeActivity(), 500);
+          }
+          setTimeout(() => setIsTransitioning(false), 500);
+      }, 500);
+  };
+
   const connectToPeer = (targetId: string) => {
       if (!peerRef.current || !localStream || peersRef.current.has(targetId) || targetId === peerId) return;
-      if (peersRef.current.size >= MAX_PEERS_LIMIT) { addLog("Salon plein (Max 4)", "error"); return; }
-
-      const streamToSend = processedStream || setupAudioGraph(localStream);
-      const call = peerRef.current.call(targetId, streamToSend, { metadata: { displayName: displayName, avatar: localAvatarRef.current } });
-      const conn = peerRef.current.connect(targetId, { metadata: { displayName: displayName, avatar: localAvatarRef.current } });
-
-      addPeer(targetId, { displayName: 'Connexion...', mediaCall: call, dataConn: conn });
-      setupCallEvents(call, targetId);
-      setupDataEvents(conn, targetId);
+      setIsTransitioning(true);
+      playSound(SOUND_ENTER_ROOM);
+      
+      setTimeout(() => {
+          setViewState('room');
+          setIsWaitingForHost(true);
+          setTimeout(() => setIsTransitioning(false), 500);
+          
+          const streamToSend = processedStream || setupAudioGraph(localStream);
+          const call = peerRef.current!.call(targetId, streamToSend, { metadata: { displayName: displayName, avatar: localAvatarRef.current } });
+          const conn = peerRef.current!.connect(targetId, { metadata: { displayName: displayName, avatar: localAvatarRef.current } });
+          addPeer(targetId, { displayName: 'Appel en cours...', mediaCall: call, dataConn: conn });
+          setupCallEvents(call, targetId);
+          setupDataEvents(conn, targetId);
+      }, 500);
   };
 
   const setupCallEvents = (call: MediaConnection, remoteId: string) => {
       call.on('stream', (stream) => {
           addPeer(remoteId, { stream });
           setupRemoteAudioAnalyzer(remoteId, stream);
+          setIsWaitingForHost(false); 
       });
       call.on('close', () => removePeer(remoteId));
-      call.on('error', () => removePeer(remoteId));
+      call.on('error', () => { removePeer(remoteId); setIsWaitingForHost(false); });
   };
 
   const setupDataEvents = (conn: DataConnection, remoteId: string) => {
@@ -379,16 +436,13 @@ export default function App() {
               currentActivity: myActivityRef.current
           });
           conn.send({ type: 'profile-update', avatar: localAvatarRef.current, displayName: displayNameRef.current });
-          
           playSound(SOUND_JOIN);
-          addLog(`${remoteId} a rejoint`, "success");
       });
-
       conn.on('data', (data: NetworkMessage) => {
           handleNetworkMessage(remoteId, data);
       });
       conn.on('close', () => removePeer(remoteId));
-      conn.on('error', () => removePeer(remoteId));
+      conn.on('error', () => { removePeer(remoteId); });
   };
 
   const handleNetworkMessage = (senderId: string, data: NetworkMessage) => {
@@ -418,30 +472,82 @@ export default function App() {
       }
   };
 
+  // --- ACTIVITY HANDLERS ---
+  const handleActivityMessage = (senderId: string, data: ActivityMessage) => {
+    if (data.activityType === 'youtube' && activityView?.type === 'youtube') {
+         if (data.action === 'sync-state' && playerRef.current) {
+             isRemoteUpdateRef.current = true;
+             const { playerState, currentTime } = data.data!;
+             const myTime = playerRef.current.getCurrentTime();
+             if (Math.abs(myTime - (currentTime || 0)) > 1.5) playerRef.current.seekTo(currentTime, true);
+             if (playerState === 1 && playerRef.current.getPlayerState() !== 1) playerRef.current.playVideo();
+             else if (playerState === 2) playerRef.current.pauseVideo();
+             setTimeout(() => { isRemoteUpdateRef.current = false; }, 800);
+         } else if (data.action === 'add-queue') {
+             if(data.data?.queueItem) setYoutubeQueue(prev => [...prev, data.data!.queueItem!]);
+         } else if (data.action === 'remove-queue') {
+             if(data.data?.videoId) setYoutubeQueue(prev => prev.filter(i => i.id !== data.data!.videoId));
+         } else if (data.action === 'play-queue') {
+             if(data.data?.queueItem) {
+                 setCurrentVideo(data.data.queueItem);
+                 if(playerRef.current) playerRef.current.loadVideoById(data.data.queueItem.videoId);
+             }
+         } else if (data.action === 'update-queue') {
+             if (data.data?.queue) setYoutubeQueue(data.data.queue);
+         }
+    } 
+    else if (data.activityType === 'whiteboard') {
+        if (activityView?.type !== 'whiteboard') return; 
+        
+        if (data.action === 'draw' && data.data?.drawData) {
+            const page = data.data.pageIndex || 0;
+            // Store in history
+            if(!wbHistoryRef.current.has(page)) wbHistoryRef.current.set(page, []);
+            wbHistoryRef.current.get(page)?.push(data.data.drawData);
+            
+            // Only draw if we are on the SAME page
+            if (page === wbPageIndex && canvasRef.current) {
+                drawOnCanvas(data.data.drawData, canvasRef.current);
+            }
+        } else if (data.action === 'clear') {
+             if(canvasRef.current && wbPageIndex === wbPageIndex) {
+                 const ctx = canvasRef.current.getContext('2d');
+                 ctx?.clearRect(0,0, canvasRef.current.width, canvasRef.current.height);
+             }
+             wbHistoryRef.current.set(wbPageIndex, []);
+        } else if (data.action === 'set-page' && typeof data.data?.pageIndex === 'number') {
+             setWbPageIndex(data.data.pageIndex);
+        } else if (data.action === 'sync-request') {
+             const allHistory: any[] = [];
+             wbHistoryRef.current.forEach((lines, page) => {
+                 lines.forEach(line => {
+                     allHistory.push({ action: 'draw', data: { drawData: line, pageIndex: page }});
+                 });
+             });
+             const peer = peersRef.current.get(senderId);
+             if (peer && peer.dataConn) {
+                 allHistory.forEach(msg => {
+                     peer.dataConn!.send({ type: 'activity', activityType: 'whiteboard', ...msg });
+                 });
+             }
+        }
+    }
+  };
+
   // --- WHITEBOARD LOGIC ---
   const drawOnCanvas = (data: DrawLine, canvas: HTMLCanvasElement) => {
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
-      
-      const rect = canvas.getBoundingClientRect();
       const w = canvas.width;
       const h = canvas.height;
-
-      // Coordinates are normalized (0-1), scale to canvas size
       const x = data.x * w;
       const y = data.y * h;
       const px = data.prevX * w;
       const py = data.prevY * h;
-
       ctx.lineWidth = data.size;
       ctx.lineCap = 'round';
       ctx.strokeStyle = data.isEraser ? '#FFFFFF' : data.color;
-      if (data.isEraser) {
-          ctx.globalCompositeOperation = 'destination-out'; // True eraser
-      } else {
-          ctx.globalCompositeOperation = 'source-over';
-      }
-
+      ctx.globalCompositeOperation = data.isEraser ? 'destination-out' : 'source-over';
       ctx.beginPath();
       ctx.moveTo(px, py);
       ctx.lineTo(x, y);
@@ -453,58 +559,77 @@ export default function App() {
     setPinnedView('activity');
     setMyCurrentActivity('whiteboard');
     broadcastData({ type: 'status', muted: isMuted, deafened: isDeafened, videoEnabled: isVideoEnabled, isScreenSharing: isScreenSharing, currentActivity: 'whiteboard' });
-    
-    // Clear history or load page 0
     if(!wbHistoryRef.current.has(0)) wbHistoryRef.current.set(0, []);
   };
 
-  const handleActivityMessage = (senderId: string, data: ActivityMessage) => {
-    if (data.activityType === 'youtube' && data.action === 'sync-state' && activityView?.type === 'youtube' && playerRef.current) {
-         // Sync logic (simplified)
-         isRemoteUpdateRef.current = true;
-         const { playerState, currentTime } = data.data!;
-         const myTime = playerRef.current.getCurrentTime();
-         if (Math.abs(myTime - (currentTime || 0)) > 1.5) playerRef.current.seekTo(currentTime, true);
-         if (playerState === 1 && playerRef.current.getPlayerState() !== 1) playerRef.current.playVideo();
-         else if (playerState === 2) playerRef.current.pauseVideo();
-         setTimeout(() => { isRemoteUpdateRef.current = false; }, 800);
-    } 
-    else if (data.activityType === 'whiteboard') {
-        if (activityView?.type !== 'whiteboard') return; // Ignore if I'm not in whiteboard
-        
-        if (data.action === 'draw' && data.data?.drawData && canvasRef.current) {
-            // Save to history
-            const page = data.data.pageIndex || 0;
-            if(!wbHistoryRef.current.has(page)) wbHistoryRef.current.set(page, []);
-            wbHistoryRef.current.get(page)?.push(data.data.drawData);
-
-            if (page === wbPageIndex) {
-                drawOnCanvas(data.data.drawData, canvasRef.current);
-            }
-        } else if (data.action === 'clear') {
-             if(canvasRef.current) {
-                 const ctx = canvasRef.current.getContext('2d');
-                 ctx?.clearRect(0,0, canvasRef.current.width, canvasRef.current.height);
-                 wbHistoryRef.current.set(wbPageIndex, []);
-             }
-        } else if (data.action === 'set-page' && typeof data.data?.pageIndex === 'number') {
-             setWbPageIndex(data.data.pageIndex);
-        }
-    }
+  const downloadWhiteboard = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    
+    // Create temp canvas to flatten with white background
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = canvas.width;
+    tempCanvas.height = canvas.height;
+    const tCtx = tempCanvas.getContext('2d');
+    if (!tCtx) return;
+    
+    // Fill white
+    tCtx.fillStyle = '#FFFFFF';
+    tCtx.fillRect(0, 0, tempCanvas.width, tempCanvas.height);
+    // Draw original
+    tCtx.drawImage(canvas, 0, 0);
+    
+    const link = document.createElement('a');
+    link.download = `dessin-nexus-${wbPageIndex+1}.png`;
+    link.href = tempCanvas.toDataURL('image/png');
+    link.click();
   };
 
   // --- YOUTUBE LOGIC ---
-  const startYoutubeVideo = (id: string) => {
-      setActivityView({ type: 'youtube', videoId: id });
+  const startYoutubeActivity = () => {
+      setActivityView({ type: 'youtube' });
       setPinnedView('activity');
       setMyCurrentActivity('youtube');
       broadcastData({ type: 'status', muted: isMuted, deafened: isDeafened, videoEnabled: isVideoEnabled, isScreenSharing: isScreenSharing, currentActivity: 'youtube' });
+  };
 
-      if(playerRef.current) { try { playerRef.current.destroy(); } catch(e){} }
-      setTimeout(() => {
+  const addToQueue = async () => {
+      const id = getYoutubeId(youtubeInput);
+      if (!id) return;
+      
+      const meta = await fetchVideoMeta(id);
+      const newItem: QueueItem = {
+          id: Date.now().toString(),
+          videoId: id,
+          title: meta.title,
+          thumbnail: meta.thumbnail,
+          addedBy: peerId || 'Moi',
+          addedByName: displayName
+      };
+
+      setYoutubeQueue(prev => {
+          const newQueue = [...prev, newItem];
+          broadcastData({ type: 'activity', activityType: 'youtube', action: 'add-queue', data: { queueItem: newItem } });
+          return newQueue;
+      });
+      setYoutubeInput('');
+
+      // Auto play if first
+      if (!currentVideo && youtubeQueue.length === 0) {
+          playVideo(newItem);
+      }
+  };
+
+  const playVideo = (item: QueueItem) => {
+      setCurrentVideo(item);
+      broadcastData({ type: 'activity', activityType: 'youtube', action: 'play-queue', data: { queueItem: item } });
+      
+      if(playerRef.current) { 
+          playerRef.current.loadVideoById(item.videoId);
+      } else {
           loadYouTubeAPI(() => {
               playerRef.current = new window.YT.Player('youtube-player', {
-                  height: '100%', width: '100%', videoId: id,
+                  height: '100%', width: '100%', videoId: item.videoId,
                   playerVars: { 'playsinline': 1, 'controls': 1, 'enablejsapi': 1, 'origin': window.location.origin, 'rel': 0, 'modestbranding': 1 },
                   events: {
                       'onStateChange': (e:any) => {
@@ -512,11 +637,36 @@ export default function App() {
                           if ([1,2,3].includes(e.data)) {
                              broadcastData({ type: 'activity', action: 'sync-state', activityType: 'youtube', data: { playerState: e.data, currentTime: playerRef.current.getCurrentTime() } });
                           }
+                          // Auto next
+                          if (e.data === 0) {
+                             // This part is tricky in P2P without a master. Let's let the user click next for now to avoid conflicts.
+                          }
                       },
                   }
               });
           });
-      }, 100);
+      }
+  };
+
+  const removeFromQueue = (itemId: string) => {
+      setYoutubeQueue(prev => {
+          const newQueue = prev.filter(i => i.id !== itemId);
+          broadcastData({ type: 'activity', activityType: 'youtube', action: 'remove-queue', data: { videoId: itemId } });
+          return newQueue;
+      });
+  };
+
+  const moveQueueItem = (index: number, direction: 'up' | 'down') => {
+      setYoutubeQueue(prev => {
+          const newQueue = [...prev];
+          if (direction === 'up' && index > 0) {
+              [newQueue[index], newQueue[index - 1]] = [newQueue[index - 1], newQueue[index]];
+          } else if (direction === 'down' && index < newQueue.length - 1) {
+              [newQueue[index], newQueue[index + 1]] = [newQueue[index + 1], newQueue[index]];
+          }
+          broadcastData({ type: 'activity', activityType: 'youtube', action: 'update-queue', data: { queue: newQueue } });
+          return newQueue;
+      });
   };
 
   // --- AUDIO ANALYSIS (REMOTE) ---
@@ -530,14 +680,12 @@ export default function App() {
       peerAnalysersRef.current.set(peerId, analyser);
   };
 
-  // Audio Activity Loop
   useEffect(() => {
       const loop = () => {
           if (peerAnalysersRef.current.size > 0) {
               const dataArray = new Uint8Array(128);
               setPeers(prev => {
                   let changed = false;
-                  // Fix: Explicitly type the new Map to avoid 'unknown' inference
                   const newMap = new Map<string, RemotePeer>(prev);
                   newMap.forEach((peer, id) => {
                       const analyser = peerAnalysersRef.current.get(id);
@@ -567,7 +715,6 @@ export default function App() {
       setupDataEvents(conn, conn.peer);
       const meta = conn.metadata || {};
       addPeer(conn.peer, { displayName: meta.displayName || 'Ami', avatar: meta.avatar, dataConn: conn });
-      
       const currentPeerIds = Array.from(peersRef.current.keys());
       if (currentPeerIds.length > 0) {
           setTimeout(() => conn.send({ type: 'peer-list', peers: currentPeerIds }), 500);
@@ -584,21 +731,34 @@ export default function App() {
     if (!incomingCall || !localStream) return;
     const call = incomingCall.call;
     const meta = incomingCall.metadata || {};
-    call.answer(processedStream || setupAudioGraph(localStream));
+    const streamToSend = processedStream || setupAudioGraph(localStream);
+    call.answer(streamToSend);
     setupCallEvents(call, call.peer);
     addPeer(call.peer, { displayName: meta.displayName || 'Ami', avatar: meta.avatar, mediaCall: call });
     setIncomingCall(null);
   };
 
+  const rejectCall = () => {
+      if (incomingCall) {
+          incomingCall.call.close();
+          setIncomingCall(null);
+      }
+  };
+
   const leaveRoom = () => {
+      setIsTransitioning(true);
       peersRef.current.forEach(peer => {
           if (peer.mediaCall) peer.mediaCall.close();
           if (peer.dataConn) peer.dataConn.close();
       });
-      setPeers(new Map());
-      peerAnalysersRef.current.clear();
-      setActivityView(null); setPinnedView(null);
-      setViewState('lobby');
+      setTimeout(() => {
+          setPeers(new Map());
+          peerAnalysersRef.current.clear();
+          setActivityView(null); setPinnedView(null);
+          setViewState('lobby');
+          setIsWaitingForHost(false);
+          setIsTransitioning(false);
+      }, 300);
       addLog("Déconnecté.", "info");
       playSound(SOUND_LEAVE);
   };
@@ -626,16 +786,17 @@ export default function App() {
       const activity = isLocal ? myCurrentActivity : peer.currentActivity;
 
       return (
-          <div className={`relative bg-black/40 backdrop-blur-md rounded-3xl overflow-hidden flex items-center justify-center border border-white/5 group w-full h-full shadow-2xl transition-all duration-300
-               ${speaking ? 'border-cyan-500 shadow-[0_0_20px_rgba(6,182,212,0.3)]' : ''}`}
-               onDoubleClick={() => setPinnedView(pinnedView === id ? null : id || 'local')}
+          <div className={`relative bg-[#1e1e1e] rounded-3xl overflow-hidden flex items-center justify-center group w-full h-full shadow-lg transition-all duration-500 ease-out-expo border border-white/5
+               ${speaking ? 'border-cyan-500 shadow-[0_0_20px_rgba(6,182,212,0.2)]' : ''}`}
+               onDoubleClick={() => {
+                   if(id) setPinnedView(pinnedView === id ? null : id);
+               }}
                onContextMenu={!isLocal ? (e) => { e.preventDefault(); setContextMenu({x: e.clientX, y: e.clientY, peerId: peer.id}) } : undefined}
           >
-              {/* Show Avatar if video disabled OR user is screen sharing (if we want to hide their face) - usually we want to see screen if screen sharing */}
               {(!status.videoEnabled && !status.isScreenSharing) && (
-                  <div className={`w-28 h-28 rounded-full flex items-center justify-center overflow-hidden z-20 ${speaking ? 'ring-4 ring-cyan-500 shadow-[0_0_30px_#06b6d4]' : ''} transition-all duration-300 transform group-hover:scale-110`}>
+                  <div className={`w-28 h-28 rounded-full flex items-center justify-center overflow-hidden z-20 ${speaking ? 'ring-4 ring-cyan-500' : ''} transition-all duration-300 transform group-hover:scale-110`}>
                       {avatar ? <img src={avatar} className="w-full h-full object-cover"/> : 
-                      <div className="w-full h-full bg-gradient-to-tr from-violet-600 to-cyan-500 flex items-center justify-center text-4xl font-bold text-white">{getInitials(display)}</div>}
+                      <div className="w-full h-full bg-gradient-to-tr from-gray-700 to-gray-600 flex items-center justify-center text-4xl font-bold text-white">{getInitials(display)}</div>}
                   </div>
               )}
               
@@ -643,37 +804,38 @@ export default function App() {
                  ref={(el) => { 
                      if(el && stream) { 
                          el.srcObject = stream; 
-                         // Logic for deafening: If I am deafened, I mute everyone else LOCALLY.
-                         // Logic for muting: If THEY are muted, the stream audio track is disabled anyway, but good to ensure.
                          el.muted = isLocal || isDeafened; 
                          if(!isLocal) {
-                            el.volume = isDeafened ? 0 : peer.volume; // Apply Local Volume Control & Deafen
+                            el.volume = isDeafened ? 0 : peer.volume; 
                             if ('setSinkId' in el && selectedSpeakerId) (el as any).setSinkId(selectedSpeakerId);
                          }
                          el.play().catch(()=>{});
                      }
                  }}
-                 autoPlay playsInline className={`absolute inset-0 w-full h-full bg-[#050505] ${status.videoEnabled || status.isScreenSharing ? 'block' : 'hidden'} ${status.isScreenSharing ? 'object-contain' : (isLocal ? 'object-cover scale-x-[-1]' : 'object-cover')}`}
+                 autoPlay playsInline className={`absolute inset-0 w-full h-full bg-[#111] ${status.videoEnabled || status.isScreenSharing ? 'block' : 'hidden'} ${status.isScreenSharing ? 'object-contain' : (isLocal ? 'object-cover scale-x-[-1]' : 'object-cover')}`}
               />
-              <div className="absolute bottom-4 left-4 bg-black/60 backdrop-blur-xl px-4 py-2 rounded-full text-white text-xs font-bold border border-white/10 flex items-center z-30 select-none">
+              <div className="absolute bottom-4 left-4 bg-black/60 backdrop-blur-md px-3 py-1.5 rounded-full text-white text-xs font-bold border border-white/5 flex items-center z-30 select-none">
                   {display}
                   {status.muted && <i className="fas fa-microphone-slash text-red-500 ml-2"></i>}
                   {status.deafened && <i className="fas fa-headphones-alt text-red-500 ml-2"></i>}
               </div>
               
-              {/* Activity Indicator (If not local and doing something) */}
               {!isLocal && activity !== 'none' && (
                   <div className="absolute top-4 right-4 flex flex-col items-end space-y-2 z-30">
-                      <div className="bg-black/60 backdrop-blur px-3 py-1.5 rounded-full border border-white/10 text-xs font-bold text-white flex items-center animate-in fade-in slide-in-from-right-4">
+                      <div className="bg-black/60 backdrop-blur px-3 py-1.5 rounded-full border border-white/10 text-xs font-bold text-white flex items-center">
                           <i className={`fas ${activity === 'youtube' ? 'fa-play text-red-500' : 'fa-pen text-cyan-500'} mr-2`}></i>
                           {activity === 'youtube' ? 'Regarde YouTube' : 'Dessine'}
                       </div>
-                      {/* Join Button if I'm not doing the same thing */}
                       {activityView?.type !== activity && (
                           <button onClick={() => { 
-                               if (activity === 'whiteboard') startWhiteboard();
+                               if (activity === 'whiteboard') {
+                                   startWhiteboard();
+                                   broadcastData({ type: 'activity', activityType: 'whiteboard', action: 'sync-request' });
+                               } else if (activity === 'youtube') {
+                                   startYoutubeActivity();
+                               }
                            }} 
-                           className="bg-cyan-500 hover:bg-cyan-400 text-black px-3 py-1.5 rounded-full text-xs font-bold shadow-lg shadow-cyan-500/20 transition-transform hover:scale-105">
+                           className="bg-cyan-600 hover:bg-cyan-500 text-white px-3 py-1 rounded-full text-xs font-bold transition-transform hover:scale-105">
                            Rejoindre
                           </button>
                       )}
@@ -683,141 +845,51 @@ export default function App() {
       );
   };
 
-  // --- WHITEBOARD CANVAS COMPONENT LOGIC (Inside Render) ---
-  const renderWhiteboard = () => {
-      return (
-          <div className="w-full h-full bg-white relative flex flex-col animate-in fade-in">
-              <div className="h-14 bg-gray-100 border-b flex items-center px-4 justify-between shrink-0">
-                  <div className="flex space-x-2 items-center">
-                      <div className="flex bg-white rounded-lg p-1 border shadow-sm">
-                          {['#000000', '#EF4444', '#22C55E', '#3B82F6', '#EAB308', '#A855F7'].map(c => (
-                              <button key={c} onClick={()=> {setWbColor(c); setWbIsEraser(false)}} className={`w-6 h-6 rounded mx-0.5 ${wbColor === c && !wbIsEraser ? 'ring-2 ring-offset-1 ring-black' : ''} transition-all hover:scale-110`} style={{backgroundColor: c}}></button>
-                          ))}
-                      </div>
-                      <div className="h-8 w-px bg-gray-300 mx-2"></div>
-                      <button onClick={()=>setWbIsEraser(!wbIsEraser)} className={`p-2 rounded hover:bg-gray-200 ${wbIsEraser ? 'bg-gray-300' : ''} transition-colors`}><i className="fas fa-eraser text-gray-700"></i></button>
-                      <input type="range" min="1" max="20" value={wbSize} onChange={(e)=>setWbSize(parseInt(e.target.value))} className="w-24" />
-                  </div>
-                  <div className="flex items-center space-x-4">
-                      <div className="flex items-center space-x-2 bg-white px-2 py-1 rounded border">
-                          <button onClick={()=>{
-                              const newPage = Math.max(0, wbPageIndex - 1);
-                              setWbPageIndex(newPage);
-                              broadcastData({type:'activity', activityType:'whiteboard', action:'set-page', data:{pageIndex: newPage}});
-                          }} className="w-6 h-6 hover:bg-gray-100 rounded transition-colors"><i className="fas fa-chevron-left text-xs"></i></button>
-                          <span className="text-sm font-mono w-4 text-center">{wbPageIndex + 1}</span>
-                          <button onClick={()=>{
-                              const newPage = wbPageIndex + 1;
-                              setWbPageIndex(newPage);
-                              broadcastData({type:'activity', activityType:'whiteboard', action:'set-page', data:{pageIndex: newPage}});
-                          }} className="w-6 h-6 hover:bg-gray-100 rounded transition-colors"><i className="fas fa-chevron-right text-xs"></i></button>
-                      </div>
-                      <button onClick={()=>{
-                           const link = document.createElement('a');
-                           link.download = `dessin-page-${wbPageIndex+1}.png`;
-                           link.href = canvasRef.current?.toDataURL() || '';
-                           link.click();
-                      }} className="text-gray-600 hover:text-black transition-colors"><i className="fas fa-download"></i></button>
-                      <button onClick={() => {
-                          const ctx = canvasRef.current?.getContext('2d');
-                          ctx?.clearRect(0,0, canvasRef.current!.width, canvasRef.current!.height);
-                          wbHistoryRef.current.set(wbPageIndex, []);
-                          broadcastData({type:'activity', activityType:'whiteboard', action:'clear'});
-                      }} className="text-red-500 hover:bg-red-50 p-2 rounded transition-colors"><i className="fas fa-trash"></i></button>
-                  </div>
-              </div>
-              <canvas 
-                  ref={el => {
-                      if (el) {
-                          canvasRef.current = el;
-                          if (el.width !== el.offsetWidth) {
-                              el.width = el.offsetWidth;
-                              el.height = el.offsetHeight;
-                              const history = wbHistoryRef.current.get(wbPageIndex) || [];
-                              const ctx = el.getContext('2d');
-                              ctx?.clearRect(0,0, el.width, el.height); 
-                              history.forEach(line => drawOnCanvas(line, el));
-                          }
-                      }
-                  }}
-                  className="flex-1 cursor-crosshair touch-none"
-                  onMouseDown={(e) => {
-                       const rect = e.currentTarget.getBoundingClientRect();
-                       const x = (e.clientX - rect.left) / rect.width;
-                       const y = (e.clientY - rect.top) / rect.height;
-                       (e.currentTarget as any).isDrawing = true;
-                       (e.currentTarget as any).lastPos = { x, y };
-                  }}
-                  onMouseMove={(e) => {
-                      const el = e.currentTarget as any;
-                      if (!el.isDrawing) return;
-                      const rect = e.currentTarget.getBoundingClientRect();
-                      const x = (e.clientX - rect.left) / rect.width;
-                      const y = (e.clientY - rect.top) / rect.height;
-                      
-                      const drawData: DrawLine = {
-                          prevX: el.lastPos.x, prevY: el.lastPos.y,
-                          x, y, color: wbColor, size: wbSize, isEraser: wbIsEraser
-                      };
-                      
-                      drawOnCanvas(drawData, e.currentTarget);
-                      if(!wbHistoryRef.current.has(wbPageIndex)) wbHistoryRef.current.set(wbPageIndex, []);
-                      wbHistoryRef.current.get(wbPageIndex)?.push(drawData);
-                      broadcastData({ type: 'activity', activityType: 'whiteboard', action: 'draw', data: { drawData, pageIndex: wbPageIndex } });
-                      
-                      el.lastPos = { x, y };
-                  }}
-                  onMouseUp={(e) => { (e.currentTarget as any).isDrawing = false; }}
-                  onMouseLeave={(e) => { (e.currentTarget as any).isDrawing = false; }}
-              />
-          </div>
-      );
-  };
-
   // --- RENDER MAIN ---
   
-  // LOGIN SCREEN
+  // TRANSITION OVERLAY
+  const transitionOverlay = (
+      <div className={`fixed inset-0 bg-black z-[100] transition-opacity duration-500 pointer-events-none ${isTransitioning ? 'opacity-100' : 'opacity-0'}`}></div>
+  );
+
   if (viewState === 'login') {
       return (
-          <div className="h-screen flex items-center justify-center bg-[#050505] relative overflow-hidden font-sans text-white">
-              <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,_var(--tw-gradient-stops))] from-violet-900/20 via-black to-black animate-pulse-slow"></div>
-              <div className="w-full max-w-md bg-white/5 backdrop-blur-3xl p-10 rounded-3xl border border-white/10 shadow-2xl relative z-10 animate-in fade-in zoom-in duration-500">
-                  <div className="w-20 h-20 rounded-2xl bg-gradient-to-tr from-cyan-400 to-violet-600 flex items-center justify-center mx-auto mb-8 shadow-lg shadow-cyan-500/20 transform hover:rotate-6 transition-transform">
-                      <i className="fas fa-bolt text-4xl text-white"></i>
+          <div className="h-screen flex items-center justify-center bg-[#09090b] font-sans text-white">
+              {transitionOverlay}
+              <div className="w-full max-w-sm bg-[#18181b] p-8 rounded-3xl border border-white/5 shadow-2xl animate-in fade-in zoom-in duration-700">
+                  <div className="flex justify-center mb-8">
+                      <div className="w-16 h-16 bg-white rounded-2xl flex items-center justify-center text-black text-3xl shadow-white/20 shadow-lg">
+                          <i className="fas fa-shapes"></i>
+                      </div>
                   </div>
-                  <h1 className="text-4xl font-black text-center mb-2 tracking-tight">Nexus</h1>
-                  <p className="text-gray-400 text-center mb-8">Espace collaboratif temps réel P2P.</p>
+                  <h1 className="text-3xl font-bold text-center mb-2">Nexus</h1>
+                  <p className="text-gray-500 text-center mb-8 text-sm">Communication simplifiée.</p>
                   <form onSubmit={(e) => {
                       e.preventDefault();
                       if (!username.trim()) return;
                       setIsLoading(true);
                       const myId = `${username.replace(/[^a-zA-Z0-9_-]/g, '')}-${Math.floor(Math.random() * 9000) + 1000}`;
                       setPeerId(myId); setDisplayName(username);
-                      
                       loadDevices().then(async () => {
                          try {
-                             const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
                              setLocalStream(stream);
                              setupAudioGraph(stream);
-                             // Mute video track initially if user wants (optional), here we keep it but disable track to start "audio only" maybe? 
-                             // Let's keep camera ACTIVE but track ENABLED=FALSE to simulate "camera off" visual.
-                             stream.getVideoTracks().forEach(t => t.enabled = false);
-                             
                              const peer = new window.Peer(myId);
                              peerRef.current = peer;
                              peer.on('open', () => { setIsLoading(false); setViewState('lobby'); });
                              peer.on('connection', handleIncomingConnection);
                              peer.on('call', handleIncomingCall);
                              peer.on('error', (e) => { addLog("Erreur connexion", "error"); setIsLoading(false); });
-                         } catch(e) { setLoginError("Accès Micro/Caméra requis"); setIsLoading(false); }
+                         } catch(e) { setLoginError("Accès Micro requis"); setIsLoading(false); }
                       });
                   }}>
-                      <input type="text" value={username} onChange={e=>setUsername(e.target.value)} className="w-full bg-black/40 border border-white/10 rounded-xl p-4 text-white placeholder-gray-500 focus:border-cyan-500 focus:outline-none transition-colors mb-4 text-center font-bold" placeholder="Votre Pseudo" />
-                      <button disabled={isLoading} className="w-full bg-white text-black py-4 rounded-xl font-black hover:bg-cyan-50 transition-all hover:scale-[1.02] shadow-lg shadow-white/10 active:scale-95">
-                        {isLoading ? "Connexion..." : "ENTRER"}
+                      <input type="text" value={username} onChange={e=>setUsername(e.target.value)} className="w-full bg-[#27272a] border border-transparent focus:border-white/20 rounded-xl p-3 text-white placeholder-gray-500 focus:outline-none transition-all mb-4 text-center font-medium" placeholder="Pseudo" />
+                      <button disabled={isLoading} className="w-full bg-white text-black py-3 rounded-xl font-bold hover:bg-gray-200 transition-all">
+                        {isLoading ? "..." : "Commencer"}
                       </button>
                   </form>
-                  {loginError && <p className="text-red-500 text-center mt-4 text-sm font-bold animate-pulse">{loginError}</p>}
+                  {loginError && <p className="text-red-500 text-center mt-4 text-xs font-bold">{loginError}</p>}
               </div>
           </div>
       );
@@ -826,55 +898,100 @@ export default function App() {
   // LOBBY SCREEN
   if (viewState === 'lobby') {
       return (
-          <div className="h-screen bg-[#050505] flex overflow-hidden font-sans text-white selection:bg-cyan-500/30">
-               {/* Simplified Lobby Sidebar */}
-               <div className="w-80 bg-[#0a0a0a] border-r border-white/5 p-6 flex flex-col z-20">
-                   <div className="flex items-center space-x-4 mb-10">
-                       <div className="w-16 h-16 rounded-full bg-gradient-to-br from-violet-600 to-cyan-500 p-0.5 cursor-pointer hover:scale-105 transition-transform" onClick={()=>fileInputRef.current?.click()}>
-                           <div className="w-full h-full rounded-full bg-black overflow-hidden group relative">
-                               {localAvatar ? <img src={localAvatar} className="w-full h-full object-cover"/> : <div className="w-full h-full flex items-center justify-center font-bold text-xl">{getInitials(displayName)}</div>}
-                               <div className="absolute inset-0 bg-black/50 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"><i className="fas fa-camera"></i></div>
+          <div className="h-screen bg-[#09090b] flex overflow-hidden font-sans text-white selection:bg-white/20">
+               {transitionOverlay}
+               <div className="w-80 bg-[#121212] border-r border-white/5 p-6 flex flex-col z-20">
+                   <div className="flex items-center space-x-4 mb-8">
+                       <div className="w-14 h-14 rounded-full bg-[#27272a] p-0.5 cursor-pointer hover:ring-2 ring-white/20 transition-all" onClick={()=>fileInputRef.current?.click()}>
+                           <div className="w-full h-full rounded-full overflow-hidden relative group">
+                               {localAvatar ? <img src={localAvatar} className="w-full h-full object-cover"/> : <div className="w-full h-full flex items-center justify-center font-bold text-lg bg-[#3f3f46] text-white">{getInitials(displayName)}</div>}
+                               <div className="absolute inset-0 bg-black/40 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"><i className="fas fa-camera text-xs"></i></div>
                            </div>
                        </div>
                        <div>
-                           <h2 className="font-bold text-lg">{displayName}</h2>
-                           <div className="text-xs text-gray-500 font-mono bg-white/5 px-2 py-1 rounded mt-1 cursor-pointer hover:bg-white/10 transition-colors" onClick={()=>navigator.clipboard.writeText(peerId||'')}>{peerId}</div>
+                           <h2 className="font-bold text-sm">{displayName}</h2>
+                           <div className="text-[10px] text-gray-500 font-mono bg-[#27272a] px-2 py-0.5 rounded mt-1 cursor-pointer flex items-center group" onClick={()=>{navigator.clipboard.writeText(peerId||''); addLog('Copié !', 'success')}}>
+                               {peerId} <i className="fas fa-copy ml-1 opacity-0 group-hover:opacity-100"></i>
+                           </div>
                        </div>
                    </div>
                    
-                   <h3 className="text-xs font-bold text-gray-500 uppercase tracking-widest mb-4">Rejoindre</h3>
-                   <form onSubmit={(e)=>{ e.preventDefault(); if(remoteIdInput.trim() !== peerId) {setViewState('room'); playSound(SOUND_ENTER_ROOM); connectToPeer(remoteIdInput.trim());} }} className="space-y-4">
-                       <input type="text" value={remoteIdInput} onChange={e=>setRemoteIdInput(e.target.value)} placeholder="ID du salon..." className="w-full bg-white/5 border border-white/5 rounded-xl p-3 focus:border-cyan-500 focus:outline-none text-sm transition-colors" />
-                       <button className="w-full bg-white/10 hover:bg-white/20 py-3 rounded-xl font-bold text-sm transition-all active:scale-95">Rejoindre</button>
+                   <h3 className="text-xs font-bold text-gray-600 uppercase tracking-wider mb-3">Connexion Rapide</h3>
+                   <form onSubmit={(e)=>{ e.preventDefault(); if(remoteIdInput.trim() !== peerId) { connectToPeer(remoteIdInput.trim());} }} className="space-y-3">
+                       <input type="text" value={remoteIdInput} onChange={e=>setRemoteIdInput(e.target.value)} placeholder="ID du salon..." className="w-full bg-[#27272a] rounded-lg p-2.5 text-xs focus:ring-1 ring-white/20 focus:outline-none transition-all" />
+                       <button className="w-full bg-white text-black py-2.5 rounded-lg font-bold text-xs hover:bg-gray-200 transition-colors">
+                           Rejoindre
+                       </button>
                    </form>
-                   
-                   <div className="mt-auto">
-                        <input type="file" ref={fileInputRef} onChange={e=>{ const f = e.target.files?.[0]; if(f){const r = new FileReader(); r.onloadend=()=>{localAvatarRef.current=r.result as string; setLocalAvatar(r.result as string);}; r.readAsDataURL(f);} }} className="hidden"/>
-                   </div>
+                   <input type="file" ref={fileInputRef} onChange={e=>{ const f = e.target.files?.[0]; if(f){const r = new FileReader(); r.onloadend=()=>{localAvatarRef.current=r.result as string; setLocalAvatar(r.result as string);}; r.readAsDataURL(f);} }} className="hidden"/>
                </div>
 
-               {/* Lobby Dashboard */}
-               <div className="flex-1 p-10 overflow-y-auto relative">
-                   <div className="absolute top-0 right-0 w-[600px] h-[600px] bg-cyan-500/10 rounded-full blur-[150px] pointer-events-none animate-pulse-slow"></div>
-                   <h1 className="text-5xl font-black mb-2 animate-in slide-in-from-left-4 duration-500">Bienvenue</h1>
-                   <p className="text-gray-400 mb-12 text-lg animate-in slide-in-from-left-4 duration-700 delay-100">Choisissez un type de salon pour commencer.</p>
+               <div className="flex-1 p-8 md:p-12 overflow-y-auto bg-[#09090b]">
+                   <div className="max-w-5xl mx-auto">
+                       <header className="mb-12">
+                           <h1 className="text-3xl font-bold mb-1">Espaces</h1>
+                           <p className="text-gray-500 text-sm">Créez un salon instantané.</p>
+                       </header>
 
-                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 relative z-10">
-                       {[
-                           { t: "Duo", c: 2, i: "fa-user-friends", g: "from-cyan-500 to-blue-600" },
-                           { t: "Squad", c: 3, i: "fa-users", g: "from-violet-500 to-purple-600" },
-                           { t: "Full", c: 4, i: "fa-globe", g: "from-pink-500 to-rose-600" },
-                           { t: "Ciné", c: 4, i: "fa-film", g: "from-amber-500 to-orange-600", mode: 'cinema' }
-                       ].map((item, i) => (
-                           <div key={i} onClick={()=>{ setRoomCapacity(item.c); setViewState('room'); playSound(SOUND_ENTER_ROOM); if(item.mode==='cinema'){ setTimeout(()=>{startYoutubeVideo('');},500); } }} 
-                                className="group bg-white/5 hover:bg-white/10 border border-white/5 p-8 rounded-3xl cursor-pointer transition-all duration-300 hover:-translate-y-2 relative overflow-hidden animate-in zoom-in" style={{animationDelay: `${i*100}ms`}}>
-                               <div className={`w-14 h-14 rounded-2xl bg-gradient-to-br ${item.g} flex items-center justify-center text-2xl mb-6 shadow-lg group-hover:scale-110 transition-transform duration-300`}>
-                                   <i className={`fas ${item.i}`}></i>
+                       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-12">
+                           {[
+                               { t: "Duo", c: 2, icon: "fa-user", bg: "bg-[#18181b]" },
+                               { t: "Squad", c: 3, icon: "fa-users", bg: "bg-[#18181b]" },
+                               { t: "Full", c: 4, icon: "fa-globe", bg: "bg-[#18181b]" },
+                               { t: "Ciné", c: 4, icon: "fa-play", mode: 'cinema', bg: "bg-[#27272a]" }
+                           ].map((item, i) => (
+                               <div key={i} onClick={()=>{ startRoomTransition(item.c, item.mode as any); }} 
+                                    className={`${item.bg} hover:bg-[#3f3f46] border border-white/5 p-6 rounded-2xl cursor-pointer transition-all duration-300 hover:-translate-y-1 h-40 flex flex-col justify-between group shadow-lg`}>
+                                   <div className="flex justify-between items-start">
+                                       <div className="text-2xl text-white group-hover:text-white/80 transition-colors"><i className={`fas ${item.icon}`}></i></div>
+                                       <span className="text-[10px] bg-black/20 px-2 py-0.5 rounded text-gray-400">{item.c} max</span>
+                                   </div>
+                                   <div>
+                                       <h3 className="font-bold">{item.t}</h3>
+                                   </div>
                                </div>
-                               <h3 className="font-bold text-2xl">{item.t}</h3>
-                               <p className="text-sm text-gray-400 mt-2">Capacité: {item.c} personnes</p>
+                           ))}
+                       </div>
+
+                       {/* NOUVEAUTÉS SECTION */}
+                       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                           <div className="md:col-span-2 bg-gradient-to-br from-indigo-900/50 to-purple-900/50 rounded-3xl p-8 border border-white/5 relative overflow-hidden group">
+                                <div className="absolute top-0 right-0 w-64 h-64 bg-purple-500/20 rounded-full blur-3xl -mr-16 -mt-16 pointer-events-none"></div>
+                                <div className="relative z-10">
+                                    <div className="inline-block bg-white/10 backdrop-blur px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-wide mb-4 text-purple-200">
+                                        Nouveauté
+                                    </div>
+                                    <h3 className="text-2xl font-bold mb-2">Tableau Blanc 2.0</h3>
+                                    <p className="text-gray-300 text-sm mb-6 max-w-md">
+                                        Exprimez votre créativité sans limites. Dessinez à plusieurs en temps réel et exportez désormais vos créations sur fond blanc parfait.
+                                    </p>
+                                    <button onClick={()=>{ startRoomTransition(3); setTimeout(()=>startWhiteboard(), 600); }} className="bg-white text-black px-6 py-2 rounded-xl font-bold text-sm hover:bg-gray-100 transition-colors flex items-center">
+                                        Essayer maintenant <i className="fas fa-arrow-right ml-2 text-xs"></i>
+                                    </button>
+                                </div>
+                                <i className="fas fa-paint-brush absolute bottom-4 right-8 text-9xl text-white/5 group-hover:text-white/10 transition-colors rotate-12"></i>
                            </div>
-                       ))}
+
+                           <div className="bg-[#18181b] rounded-3xl p-6 border border-white/5 flex flex-col justify-between">
+                               <div>
+                                   <h3 className="font-bold text-lg mb-1">Widget</h3>
+                                   <p className="text-gray-500 text-xs">État des services</p>
+                               </div>
+                               <div className="space-y-3 mt-4">
+                                   <div className="flex items-center justify-between text-xs">
+                                       <span className="text-gray-400 flex items-center"><i className="fas fa-circle text-green-500 text-[8px] mr-2"></i> P2P Mesh</span>
+                                       <span className="font-mono text-green-400">Actif</span>
+                                   </div>
+                                   <div className="flex items-center justify-between text-xs">
+                                       <span className="text-gray-400 flex items-center"><i className="fas fa-circle text-green-500 text-[8px] mr-2"></i> Audio HQ</span>
+                                       <span className="font-mono text-green-400">Prêt</span>
+                                   </div>
+                                   <div className="w-full bg-white/5 h-1.5 rounded-full mt-2 overflow-hidden">
+                                       <div className="bg-green-500 h-full w-2/3 animate-pulse"></div>
+                                   </div>
+                               </div>
+                           </div>
+                       </div>
                    </div>
                </div>
           </div>
@@ -884,13 +1001,24 @@ export default function App() {
   // ROOM SCREEN
   const activePeers = Array.from(peers.values()) as RemotePeer[];
   
+  if (isWaitingForHost) {
+      return (
+          <div className="h-screen bg-[#09090b] flex flex-col items-center justify-center text-white">
+               {transitionOverlay}
+               <div className="w-12 h-12 border-2 border-white/20 border-t-white rounded-full animate-spin mb-6"></div>
+               <h2 className="text-lg font-bold mb-1">Connexion...</h2>
+               <p className="text-gray-500 text-sm mb-6">Attente de l'hôte.</p>
+               <button onClick={()=>{ leaveRoom(); }} className="text-red-500 hover:text-red-400 text-sm font-bold transition-colors">Annuler</button>
+          </div>
+      );
+  }
+  
   return (
-    <div className="flex h-screen bg-[#050505] overflow-hidden text-white font-sans selection:bg-cyan-500/30" onContextMenu={e => e.preventDefault()}>
-       
-       {/* Context Menu for Volume */}
+    <div className="flex h-screen bg-[#09090b] overflow-hidden text-white font-sans" onContextMenu={e => e.preventDefault()}>
+       {transitionOverlay}
        {contextMenu && (
-           <div className="fixed z-[100] bg-[#1a1a1a] border border-white/10 rounded-xl p-3 shadow-2xl w-48 backdrop-blur-xl animate-in fade-in zoom-in duration-100" style={{top: contextMenu.y, left: contextMenu.x}}>
-               <div className="text-xs font-bold text-gray-500 uppercase mb-2 px-1">Volume Local</div>
+           <div className="fixed z-[100] bg-[#18181b] border border-white/10 rounded-xl p-3 shadow-xl w-48" style={{top: contextMenu.y, left: contextMenu.x}}>
+               <div className="text-[10px] font-bold text-gray-500 uppercase mb-2 px-1">Volume Local</div>
                <input 
                   type="range" min="0" max="1" step="0.1" 
                   defaultValue={peers.get(contextMenu.peerId)?.volume || 1}
@@ -898,51 +1026,33 @@ export default function App() {
                       const vol = parseFloat(e.target.value);
                       addPeer(contextMenu.peerId, { volume: vol });
                   }}
-                  className="w-full accent-cyan-500 h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer"
+                  className="w-full accent-white h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer"
                />
-               <div className="mt-2 pt-2 border-t border-white/5 text-xs text-gray-400 px-1">Ceci n'affecte que vous.</div>
            </div>
        )}
 
         {/* Settings Modal */}
         {showSettingsModal && (
-            <div className="absolute inset-0 z-[80] flex items-center justify-center bg-black/80 backdrop-blur-md animate-in fade-in" onClick={()=>setShowSettingsModal(false)}>
-                <div className="bg-[#111] p-8 rounded-3xl w-full max-w-lg border border-white/10 shadow-2xl" onClick={e=>e.stopPropagation()}>
-                    <h3 className="text-2xl font-bold mb-6">Paramètres</h3>
-                    <div className="space-y-6">
+            <div className="absolute inset-0 z-[80] flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={()=>setShowSettingsModal(false)}>
+                <div className="bg-[#18181b] p-6 rounded-2xl w-full max-w-md border border-white/10 shadow-2xl" onClick={e=>e.stopPropagation()}>
+                    <h3 className="text-xl font-bold mb-4">Paramètres</h3>
+                    <div className="space-y-4">
                         <div>
-                            <label className="text-xs font-bold text-gray-500 uppercase block mb-2">Microphone</label>
-                            <select value={selectedMicId} onChange={e=>changeAudioInput(e.target.value)} className="w-full bg-white/5 border border-white/10 rounded-xl p-3 text-sm focus:border-cyan-500 outline-none">
+                            <label className="text-xs font-bold text-gray-500 uppercase block mb-1">Microphone</label>
+                            <select value={selectedMicId} onChange={e=>changeAudioInput(e.target.value)} className="w-full bg-[#27272a] text-white rounded-lg p-2 text-sm outline-none">
                                 <option value="">Défaut</option>
                                 {inputDevices.map(d => <option key={d.deviceId} value={d.deviceId}>{d.label}</option>)}
                             </select>
                         </div>
                         <div>
-                             <label className="text-xs font-bold text-gray-500 uppercase block mb-2">Caméra</label>
-                             <select value={selectedCamId} onChange={async (e) => {
-                                 setSelectedCamId(e.target.value);
-                                 // Simple logic to just restart stream with new video ID if needed (full impl needs restart stream logic similar to audio)
-                             }} className="w-full bg-white/5 border border-white/10 rounded-xl p-3 text-sm focus:border-cyan-500 outline-none">
-                                <option value="">Défaut</option>
-                                {/* Need to populate video devices similar to audio logic, omitted for brevity but logic is same */}
-                             </select>
+                            <label className="text-xs font-bold text-gray-500 uppercase block mb-1">Volume Gain</label>
+                            <input type="range" min="0" max="2" step="0.1" value={micGain} onChange={e=>setMicGain(parseFloat(e.target.value))} className="w-full accent-white"/>
                         </div>
-                        <div>
-                            <label className="text-xs font-bold text-gray-500 uppercase block mb-2">Sortie Audio</label>
-                            <select value={selectedSpeakerId} onChange={e=>setSelectedSpeakerId(e.target.value)} className="w-full bg-white/5 border border-white/10 rounded-xl p-3 text-sm focus:border-cyan-500 outline-none">
-                                <option value="">Défaut</option>
-                                {outputDevices.map(d => <option key={d.deviceId} value={d.deviceId}>{d.label}</option>)}
-                            </select>
-                        </div>
-                        <div>
-                            <label className="text-xs font-bold text-gray-500 uppercase block mb-2">Volume Micro (Gain)</label>
-                            <input type="range" min="0" max="2" step="0.1" value={micGain} onChange={e=>setMicGain(parseFloat(e.target.value))} className="w-full accent-cyan-500"/>
-                        </div>
-                        <div className="pt-4 border-t border-white/10">
-                            <label className="text-xs font-bold text-gray-500 uppercase block mb-2">Pseudo</label>
+                        <div className="pt-2 border-t border-white/5">
+                            <label className="text-xs font-bold text-gray-500 uppercase block mb-1">Pseudo</label>
                             <div className="flex space-x-2">
-                                <input type="text" value={displayName} onChange={e=>setDisplayName(e.target.value)} className="flex-1 bg-white/5 border border-white/10 rounded-xl p-3 text-sm" />
-                                <button onClick={()=>{broadcastData({type:'profile-update', displayName:displayName, avatar:localAvatarRef.current}); setShowSettingsModal(false);}} className="bg-white/10 hover:bg-white/20 px-4 rounded-xl font-bold text-sm">Sauver</button>
+                                <input type="text" value={displayName} onChange={e=>setDisplayName(e.target.value)} className="flex-1 bg-[#27272a] rounded-lg p-2 text-sm" />
+                                <button onClick={()=>{broadcastData({type:'profile-update', displayName:displayName, avatar:localAvatarRef.current}); setShowSettingsModal(false);}} className="bg-white text-black px-4 rounded-lg font-bold text-xs">OK</button>
                             </div>
                         </div>
                     </div>
@@ -950,19 +1060,19 @@ export default function App() {
             </div>
         )}
 
-       {/* Activity Modal */}
+       {/* Activity Selection Modal */}
        {showActivityModal && (
-           <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md animate-in fade-in" onClick={()=>setShowActivityModal(false)}>
-               <div className="bg-[#111] p-8 rounded-3xl w-full max-w-lg border border-white/10" onClick={e=>e.stopPropagation()}>
-                   <h3 className="text-2xl font-bold mb-6 text-center">Nouvelle Activité</h3>
-                   <div className="grid grid-cols-2 gap-4">
-                       <button onClick={()=>{ startYoutubeVideo(''); setShowActivityModal(false); }} className="bg-white/5 hover:bg-red-500/20 hover:border-red-500 border border-white/5 p-6 rounded-2xl flex flex-col items-center transition-all group">
-                           <i className="fab fa-youtube text-4xl text-red-500 mb-3 group-hover:scale-110 transition-transform"></i>
-                           <span className="font-bold">YouTube</span>
+           <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={()=>setShowActivityModal(false)}>
+               <div className="bg-[#18181b] p-6 rounded-2xl w-full max-w-sm border border-white/10" onClick={e=>e.stopPropagation()}>
+                   <h3 className="text-lg font-bold mb-4 text-center">Activités</h3>
+                   <div className="grid grid-cols-2 gap-3">
+                       <button onClick={()=>{ startYoutubeActivity(); setShowActivityModal(false); }} className="bg-[#27272a] hover:bg-[#3f3f46] p-4 rounded-xl flex flex-col items-center transition-colors">
+                           <i className="fab fa-youtube text-2xl text-red-500 mb-2"></i>
+                           <span className="font-bold text-sm">YouTube</span>
                        </button>
-                       <button onClick={()=>{ startWhiteboard(); setShowActivityModal(false); }} className="bg-white/5 hover:bg-cyan-500/20 hover:border-cyan-500 border border-white/5 p-6 rounded-2xl flex flex-col items-center transition-all group">
-                           <i className="fas fa-pen-nib text-4xl text-cyan-500 mb-3 group-hover:scale-110 transition-transform"></i>
-                           <span className="font-bold">Dessin</span>
+                       <button onClick={()=>{ startWhiteboard(); setShowActivityModal(false); }} className="bg-[#27272a] hover:bg-[#3f3f46] p-4 rounded-xl flex flex-col items-center transition-colors">
+                           <i className="fas fa-pen-nib text-2xl text-blue-500 mb-2"></i>
+                           <span className="font-bold text-sm">Dessin</span>
                        </button>
                    </div>
                </div>
@@ -970,85 +1080,223 @@ export default function App() {
        )}
 
        {/* Main View */}
-       <div className="flex-1 flex flex-col relative">
+       <div className="flex-1 flex flex-col relative bg-[#09090b]">
           
-          {/* Header */}
-          <div className="h-20 flex items-center justify-between px-8 absolute top-0 left-0 right-0 z-20 pointer-events-none">
-               <div className="pointer-events-auto bg-black/40 backdrop-blur-xl border border-white/5 px-4 py-2 rounded-full flex items-center space-x-3 hover:bg-black/60 transition-colors cursor-pointer" onClick={()=>navigator.clipboard.writeText(peerId||'')}>
-                   <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></div>
-                   <span className="font-mono text-sm font-bold opacity-80">{peerId}</span>
-                   <i className="fas fa-copy text-xs opacity-50"></i>
+          <div className="h-16 flex items-center justify-between px-6 z-20 pointer-events-none">
+               <div className="pointer-events-auto bg-[#18181b] px-3 py-1.5 rounded-full flex items-center space-x-2 hover:bg-[#27272a] transition-colors cursor-pointer border border-white/5" onClick={()=>navigator.clipboard.writeText(peerId||'')}>
+                   <div className="w-1.5 h-1.5 rounded-full bg-green-500"></div>
+                   <span className="font-mono text-xs font-bold text-gray-300">{peerId}</span>
                </div>
                <div className="pointer-events-auto flex space-x-2">
-                   <button onClick={()=>setShowMobileChat(!showMobileChat)} className="md:hidden w-10 h-10 bg-black/40 backdrop-blur-xl rounded-full flex items-center justify-center border border-white/5"><i className="fas fa-comment"></i></button>
-                   <button onClick={()=>setShowSettingsModal(true)} className="w-10 h-10 bg-black/40 backdrop-blur-xl rounded-full flex items-center justify-center border border-white/5 hover:bg-white hover:text-black transition-colors"><i className="fas fa-cog"></i></button>
+                   <button onClick={()=>setShowSettingsModal(true)} className="w-8 h-8 bg-[#18181b] rounded-full flex items-center justify-center border border-white/5 hover:bg-white hover:text-black transition-colors text-xs"><i className="fas fa-cog"></i></button>
                </div>
           </div>
 
-          {/* Canvas / Stage */}
-          <div className="flex-1 p-6 flex items-center justify-center relative">
+          <div className="flex-1 px-6 pb-6 flex items-center justify-center relative">
               
               {/* Activity View (Pinned) */}
               {activityView && pinnedView === 'activity' && (
-                  <div className="absolute inset-4 z-10 bg-[#111] rounded-3xl border border-white/10 overflow-hidden shadow-2xl flex flex-col animate-in zoom-in duration-300">
-                      <div className="h-12 bg-black flex items-center justify-between px-4 border-b border-white/5">
-                          <span className="font-bold text-sm flex items-center"><i className="fas fa-shapes mr-2 text-cyan-500"></i> Activité en cours</span>
-                          <button onClick={()=>{setActivityView(null); setPinnedView(null); setMyCurrentActivity('none'); broadcastData({type:'status', muted:isMuted, deafened:isDeafened, videoEnabled:isVideoEnabled, isScreenSharing:isScreenSharing, currentActivity:'none'})}} className="text-red-500 hover:bg-red-500/10 p-2 rounded-lg transition-colors"><i className="fas fa-times"></i> Quitter</button>
+                  <div className="absolute inset-4 z-10 bg-[#121212] rounded-2xl border border-white/5 overflow-hidden shadow-2xl flex flex-col animate-in zoom-in duration-300">
+                      <div className="h-10 bg-[#18181b] flex items-center justify-between px-4 border-b border-white/5">
+                          <span className="font-bold text-xs text-gray-400">
+                              {activityView.type === 'youtube' ? 'YouTube' : 'Whiteboard'}
+                          </span>
+                          <button onClick={()=>{setActivityView(null); setPinnedView(null); setMyCurrentActivity('none'); broadcastData({type:'status', muted:isMuted, deafened:isDeafened, videoEnabled:isVideoEnabled, isScreenSharing:isScreenSharing, currentActivity:'none'})}} className="text-gray-500 hover:text-red-500 transition-colors"><i className="fas fa-times"></i></button>
                       </div>
-                      <div className="flex-1 relative">
+                      
+                      <div className="flex-1 flex overflow-hidden">
+                          {/* YOUTUBE UI */}
                           {activityView.type === 'youtube' && (
-                              activityView.videoId ? <div id="youtube-player" className="w-full h-full"></div> : 
-                              <div className="w-full h-full flex flex-col items-center justify-center">
-                                  <input type="text" value={youtubeInput} onChange={e=>setYoutubeInput(e.target.value)} placeholder="Coller un lien YouTube..." className="bg-white/5 border border-white/10 rounded-xl px-4 py-3 w-80 text-center focus:outline-none focus:border-red-500 transition-colors mb-4"/>
-                                  <button onClick={()=>{const id=getYoutubeId(youtubeInput); if(id) {startYoutubeVideo(id); broadcastData({type:'activity', action:'start', activityType:'youtube', data:{videoId:id}});}}} className="bg-red-600 hover:bg-red-700 text-white px-8 py-2 rounded-xl font-bold">Lancer</button>
+                              <div className="flex w-full h-full">
+                                  {/* Player Section */}
+                                  <div className="flex-1 flex flex-col bg-black">
+                                       {currentVideo ? (
+                                           <div id="youtube-player" className="w-full h-full"></div>
+                                       ) : (
+                                           <div className="flex-1 flex flex-col items-center justify-center text-gray-600">
+                                               <i className="fab fa-youtube text-6xl mb-4 opacity-20"></i>
+                                               <p>Aucune vidéo sélectionnée</p>
+                                           </div>
+                                       )}
+                                  </div>
+                                  
+                                  {/* Sidebar Queue & Search */}
+                                  <div className="w-80 bg-[#18181b] border-l border-white/5 flex flex-col">
+                                      {/* Search Bar */}
+                                      <div className="p-4 border-b border-white/5">
+                                          <div className="flex space-x-2">
+                                              <input 
+                                                type="text" 
+                                                value={youtubeInput} 
+                                                onChange={e=>setYoutubeInput(e.target.value)} 
+                                                placeholder="Lien YouTube..." 
+                                                className="flex-1 bg-[#09090b] border border-white/10 rounded-lg px-3 py-2 text-xs focus:outline-none focus:border-red-500 transition-colors"
+                                                onKeyDown={e => {if(e.key === 'Enter') addToQueue()}}
+                                              />
+                                              <button onClick={addToQueue} className="bg-red-600 hover:bg-red-700 text-white p-2 rounded-lg transition-colors">
+                                                  <i className="fas fa-plus text-xs"></i>
+                                              </button>
+                                          </div>
+                                      </div>
+
+                                      {/* Queue List */}
+                                      <div className="flex-1 overflow-y-auto p-2 space-y-2 custom-scrollbar">
+                                          {youtubeQueue.length === 0 && <div className="text-center text-gray-600 text-xs mt-10">File d'attente vide</div>}
+                                          {youtubeQueue.map((item, idx) => (
+                                              <div key={item.id} className={`group flex items-start space-x-3 p-2 rounded-lg hover:bg-white/5 transition-colors ${currentVideo?.id === item.id ? 'bg-white/5 ring-1 ring-red-500/50' : ''}`}>
+                                                  <div className="relative w-20 h-12 bg-black rounded overflow-hidden shrink-0 cursor-pointer" onClick={()=>playVideo(item)}>
+                                                      <img src={item.thumbnail} className="w-full h-full object-cover opacity-80 hover:opacity-100 transition-opacity"/>
+                                                      <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                                                          <i className={`fas ${currentVideo?.id === item.id ? 'fa-chart-bar' : 'fa-play'} text-white shadow-black drop-shadow-md text-xs`}></i>
+                                                      </div>
+                                                  </div>
+                                                  <div className="flex-1 min-w-0">
+                                                      <h4 className="text-xs font-bold truncate text-gray-200 cursor-pointer hover:underline" onClick={()=>playVideo(item)}>{item.title}</h4>
+                                                      <p className="text-[10px] text-gray-500">Ajouté par {item.addedByName}</p>
+                                                      
+                                                      {/* Controls */}
+                                                      <div className="flex items-center space-x-2 mt-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                                          <button onClick={()=>moveQueueItem(idx, 'up')} disabled={idx===0} className="text-gray-500 hover:text-white disabled:opacity-30"><i className="fas fa-chevron-up text-[10px]"></i></button>
+                                                          <button onClick={()=>moveQueueItem(idx, 'down')} disabled={idx===youtubeQueue.length-1} className="text-gray-500 hover:text-white disabled:opacity-30"><i className="fas fa-chevron-down text-[10px]"></i></button>
+                                                          <div className="grow"></div>
+                                                          <button onClick={()=>removeFromQueue(item.id)} className="text-gray-500 hover:text-red-500"><i className="fas fa-trash text-[10px]"></i></button>
+                                                      </div>
+                                                  </div>
+                                              </div>
+                                          ))}
+                                      </div>
+                                  </div>
                               </div>
                           )}
-                          {activityView.type === 'whiteboard' && renderWhiteboard()}
+                          
+                          {/* WHITEBOARD UI */}
+                          {activityView.type === 'whiteboard' && (
+                              <div className="w-full h-full bg-white flex flex-col">
+                                  {/* Toolbar */}
+                                  <div className="h-16 border-b border-gray-200 flex items-center justify-between px-4 bg-gray-50 text-gray-800 shrink-0">
+                                      <div className="flex items-center space-x-3">
+                                          <div className="grid grid-cols-7 gap-1">
+                                              {WB_COLORS.map(c => (
+                                                  <button key={c} onClick={()=> {setWbColor(c); setWbIsEraser(false)}} className={`w-4 h-4 rounded-full hover:scale-110 transition-transform ${wbColor === c && !wbIsEraser ? 'ring-2 ring-offset-1 ring-gray-400' : ''}`} style={{backgroundColor: c}}></button>
+                                              ))}
+                                          </div>
+                                          <div className="w-px h-8 bg-gray-300 mx-2"></div>
+                                          <button onClick={()=>setWbIsEraser(!wbIsEraser)} className={`p-2 rounded hover:bg-gray-200 ${wbIsEraser ? 'bg-gray-200 text-blue-500' : 'text-gray-600'}`}><i className="fas fa-eraser"></i></button>
+                                          <input type="range" min="1" max="20" value={wbSize} onChange={(e)=>setWbSize(parseInt(e.target.value))} className="w-20" />
+                                      </div>
+                                      <div className="flex items-center space-x-3">
+                                          <div className="flex items-center space-x-1 bg-white border border-gray-300 rounded-lg px-1">
+                                              <button onClick={()=>{
+                                                  const newPage = Math.max(0, wbPageIndex - 1);
+                                                  setWbPageIndex(newPage);
+                                                  broadcastData({type:'activity', activityType:'whiteboard', action:'set-page', data:{pageIndex: newPage}});
+                                              }} className="p-2 hover:text-blue-500"><i className="fas fa-chevron-left text-xs"></i></button>
+                                              <span className="text-xs font-mono w-6 text-center">{wbPageIndex + 1}</span>
+                                              <button onClick={()=>{
+                                                  const newPage = wbPageIndex + 1;
+                                                  setWbPageIndex(newPage);
+                                                  broadcastData({type:'activity', activityType:'whiteboard', action:'set-page', data:{pageIndex: newPage}});
+                                              }} className="p-2 hover:text-blue-500"><i className="fas fa-chevron-right text-xs"></i></button>
+                                          </div>
+                                          <button onClick={downloadWhiteboard} className="text-gray-600 hover:text-black p-2"><i className="fas fa-download"></i></button>
+                                          <button onClick={() => {
+                                              const ctx = canvasRef.current?.getContext('2d');
+                                              ctx?.clearRect(0,0, canvasRef.current!.width, canvasRef.current!.height);
+                                              wbHistoryRef.current.set(wbPageIndex, []);
+                                              broadcastData({type:'activity', activityType:'whiteboard', action:'clear'});
+                                          }} className="text-red-400 hover:text-red-600 p-2"><i className="fas fa-trash"></i></button>
+                                      </div>
+                                  </div>
+                                  {/* Canvas */}
+                                  <div className="flex-1 overflow-hidden relative">
+                                    <canvas 
+                                        ref={el => {
+                                            if (el) {
+                                                canvasRef.current = el;
+                                                if (el.width !== el.offsetWidth) {
+                                                    el.width = el.offsetWidth;
+                                                    el.height = el.offsetHeight;
+                                                    const history = wbHistoryRef.current.get(wbPageIndex) || [];
+                                                    const ctx = el.getContext('2d');
+                                                    if(ctx){
+                                                        ctx.clearRect(0,0, el.width, el.height); 
+                                                        history.forEach(line => drawOnCanvas(line, el));
+                                                    }
+                                                }
+                                            }
+                                        }}
+                                        className="absolute inset-0 w-full h-full cursor-crosshair touch-none"
+                                        onMouseDown={(e) => {
+                                            const rect = e.currentTarget.getBoundingClientRect();
+                                            const x = (e.clientX - rect.left) / rect.width;
+                                            const y = (e.clientY - rect.top) / rect.height;
+                                            (e.currentTarget as any).isDrawing = true;
+                                            (e.currentTarget as any).lastPos = { x, y };
+                                        }}
+                                        onMouseMove={(e) => {
+                                            const el = e.currentTarget as any;
+                                            if (!el.isDrawing) return;
+                                            const rect = e.currentTarget.getBoundingClientRect();
+                                            const x = (e.clientX - rect.left) / rect.width;
+                                            const y = (e.clientY - rect.top) / rect.height;
+                                            const drawData: DrawLine = { prevX: el.lastPos.x, prevY: el.lastPos.y, x, y, color: wbColor, size: wbSize, isEraser: wbIsEraser };
+                                            drawOnCanvas(drawData, e.currentTarget);
+                                            if(!wbHistoryRef.current.has(wbPageIndex)) wbHistoryRef.current.set(wbPageIndex, []);
+                                            wbHistoryRef.current.get(wbPageIndex)?.push(drawData);
+                                            broadcastData({ type: 'activity', activityType: 'whiteboard', action: 'draw', data: { drawData, pageIndex: wbPageIndex } });
+                                            el.lastPos = { x, y };
+                                        }}
+                                        onMouseUp={(e) => { (e.currentTarget as any).isDrawing = false; }}
+                                        onMouseLeave={(e) => { (e.currentTarget as any).isDrawing = false; }}
+                                    />
+                                  </div>
+                              </div>
+                          )}
                       </div>
                   </div>
               )}
 
               {/* Grid */}
-              <div className={`grid gap-6 w-full h-full max-w-7xl transition-all duration-500 ease-out ${pinnedView === 'activity' ? 'opacity-0 pointer-events-none scale-90' : ''} ${activePeers.length === 0 ? 'grid-cols-1' : activePeers.length === 1 ? 'grid-cols-1 md:grid-cols-2' : 'grid-cols-2'}`}>
+              <div className={`grid gap-4 w-full h-full max-w-6xl transition-all duration-500 ease-out-expo ${pinnedView === 'activity' ? 'opacity-0 pointer-events-none scale-95' : ''} ${activePeers.length === 0 ? 'grid-cols-1' : activePeers.length === 1 ? 'grid-cols-1 md:grid-cols-2' : 'grid-cols-2'}`}>
                   {renderVideoUnit('local')}
                   {activePeers.map(peer => <div key={peer.id} className="w-full h-full animate-in zoom-in duration-500">{renderVideoUnit(peer)}</div>)}
                   {activePeers.length === 0 && (
-                      <div className="border-2 border-dashed border-white/10 rounded-3xl flex flex-col items-center justify-center text-gray-500 animate-pulse-slow">
-                          <p className="font-bold">En attente...</p>
+                      <div className="border-2 border-dashed border-white/5 rounded-3xl flex flex-col items-center justify-center text-gray-600">
+                          <p className="font-medium text-sm">En attente...</p>
                       </div>
                   )}
               </div>
           </div>
 
           {/* Bottom Bar */}
-          <div className="h-24 flex items-center justify-center space-x-4 pb-6">
-               <div className="bg-black/60 backdrop-blur-2xl border border-white/10 rounded-3xl p-2 flex items-center space-x-2 shadow-2xl transition-transform hover:-translate-y-1">
-                   <button onClick={toggleMute} className={`w-14 h-14 rounded-2xl flex items-center justify-center text-xl transition-all duration-200 active:scale-95 ${!isMuted ? 'bg-white text-black' : 'bg-red-500 text-white'}`}><i className={`fas ${!isMuted?'fa-microphone':'fa-microphone-slash'}`}></i></button>
-                   <button onClick={toggleDeafen} className={`w-14 h-14 rounded-2xl flex items-center justify-center text-xl transition-all duration-200 active:scale-95 ${!isDeafened ? 'bg-white/10 text-white hover:bg-white/20' : 'bg-red-500 text-white'}`}><i className={`fas ${!isDeafened?'fa-headphones':'fa-headphones-slash'}`}></i></button>
-                   <button onClick={toggleVideo} className={`w-14 h-14 rounded-2xl flex items-center justify-center text-xl transition-all duration-200 active:scale-95 ${isVideoEnabled ? 'bg-white text-black' : 'bg-white/10 text-white hover:bg-white/20'}`}><i className={`fas ${isVideoEnabled?'fa-video':'fa-video-slash'}`}></i></button>
-                   <button onClick={toggleScreenShare} className={`w-14 h-14 rounded-2xl flex items-center justify-center text-xl transition-all duration-200 active:scale-95 ${isScreenSharing ? 'bg-green-500 text-white' : 'bg-white/10 text-white hover:bg-white/20'}`}><i className="fas fa-desktop"></i></button>
-                   <div className="w-px h-8 bg-white/10 mx-2"></div>
-                   <button onClick={()=>setShowActivityModal(true)} className="w-14 h-14 rounded-2xl bg-gradient-to-tr from-cyan-500 to-blue-600 text-white flex items-center justify-center text-xl hover:scale-105 transition-transform shadow-lg shadow-cyan-500/30 active:scale-95"><i className="fas fa-rocket"></i></button>
-                   <button onClick={leaveRoom} className="w-20 h-14 rounded-2xl bg-red-500/20 text-red-500 hover:bg-red-500 hover:text-white flex items-center justify-center text-xl transition-all active:scale-95"><i className="fas fa-phone-slash"></i></button>
+          <div className="h-20 flex items-center justify-center space-x-3 pb-6 pointer-events-none">
+               <div className="pointer-events-auto bg-[#18181b] border border-white/5 rounded-2xl p-1.5 flex items-center space-x-2 shadow-2xl">
+                   <button onClick={toggleMute} className={`w-12 h-12 rounded-xl flex items-center justify-center text-lg transition-all duration-200 active:scale-95 ${!isMuted ? 'text-gray-300 hover:bg-white/5' : 'bg-red-500 text-white shadow-red-500/20 shadow-lg'}`}><i className={`fas ${!isMuted?'fa-microphone':'fa-microphone-slash'}`}></i></button>
+                   <button onClick={toggleDeafen} className={`w-12 h-12 rounded-xl flex items-center justify-center text-lg transition-all duration-200 active:scale-95 ${!isDeafened ? 'text-gray-300 hover:bg-white/5' : 'bg-red-500 text-white shadow-red-500/20 shadow-lg'}`}><i className={`fas ${!isDeafened?'fa-headphones':'fa-headphones-slash'}`}></i></button>
+                   <button onClick={toggleVideo} className={`w-12 h-12 rounded-xl flex items-center justify-center text-lg transition-all duration-200 active:scale-95 ${isVideoEnabled ? 'text-gray-300 hover:bg-white/5' : 'bg-red-500 text-white shadow-red-500/20 shadow-lg'}`}><i className={`fas ${isVideoEnabled?'fa-video':'fa-video-slash'}`}></i></button>
+                   <button onClick={toggleScreenShare} className={`w-12 h-12 rounded-xl flex items-center justify-center text-lg transition-all duration-200 active:scale-95 ${isScreenSharing ? 'bg-green-500 text-white' : 'text-gray-300 hover:bg-white/5'}`}><i className="fas fa-desktop"></i></button>
+                   <div className="w-px h-6 bg-white/10 mx-1"></div>
+                   <button onClick={()=>setShowActivityModal(true)} className="w-12 h-12 rounded-xl bg-gradient-to-br from-blue-600 to-indigo-600 text-white flex items-center justify-center text-lg hover:scale-105 transition-transform shadow-lg shadow-blue-500/20 active:scale-95"><i className="fas fa-rocket"></i></button>
+                   <button onClick={leaveRoom} className="w-16 h-12 rounded-xl bg-red-500/10 text-red-500 hover:bg-red-500 hover:text-white flex items-center justify-center text-lg transition-all active:scale-95"><i className="fas fa-phone-slash"></i></button>
                </div>
           </div>
 
        </div>
 
        {/* Chat Sidebar */}
-       <div className={`fixed inset-y-0 right-0 w-80 bg-[#0a0a0a] border-l border-white/5 transform transition-transform duration-300 z-40 flex flex-col ${showMobileChat ? 'translate-x-0' : 'translate-x-full md:translate-x-0 md:static'}`}>
-           <div className="h-16 flex items-center px-6 border-b border-white/5 font-bold tracking-widest text-xs text-gray-500 uppercase justify-between">
-               <span>Chat du salon</span>
-               <button className="md:hidden" onClick={()=>setShowMobileChat(false)}><i className="fas fa-times"></i></button>
+       <div className={`fixed inset-y-0 right-0 w-80 bg-[#09090b] border-l border-white/5 transform transition-transform duration-300 z-40 flex flex-col ${showMobileChat ? 'translate-x-0' : 'translate-x-full md:translate-x-0 md:static'}`}>
+           <div className="h-16 flex items-center px-4 border-b border-white/5 justify-between">
+               <span className="font-bold text-xs text-gray-500 uppercase">Chat</span>
+               <button className="md:hidden text-gray-500" onClick={()=>setShowMobileChat(false)}><i className="fas fa-times"></i></button>
            </div>
-           <div className="flex-1 overflow-y-auto p-4 custom-scrollbar space-y-4">
+           <div className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar">
                {chatHistory.map(msg => (
                    <div key={msg.id} className="animate-in slide-in-from-right-2 duration-300">
-                       <div className="flex items-baseline justify-between mb-1">
-                           <span className="font-bold text-sm text-cyan-500">{msg.senderName}</span>
+                       <div className="flex items-baseline justify-between mb-1 px-1">
+                           <span className="font-bold text-xs text-gray-300">{msg.senderName}</span>
                            <span className="text-[10px] text-gray-600">{new Date(msg.timestamp).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</span>
                        </div>
-                       <div className="bg-white/5 rounded-xl rounded-tl-none p-3 text-sm text-gray-300 leading-relaxed border border-white/5">
+                       <div className="bg-[#18181b] rounded-2xl rounded-tl-none p-3 text-sm text-gray-300 border border-white/5">
                            {msg.text}
                            {msg.image && <img src={msg.image} className="mt-2 rounded-lg" />}
                        </div>
@@ -1056,10 +1304,10 @@ export default function App() {
                ))}
                <div ref={chatBottomRef}></div>
            </div>
-           <div className="p-4 bg-[#0a0a0a] border-t border-white/5">
-               <div className="bg-white/5 rounded-xl flex items-center p-1 border border-white/5 focus-within:border-cyan-500 transition-colors">
-                   <button onClick={()=>mediaUploadRef.current?.click()} className="w-10 h-10 flex items-center justify-center text-gray-500 hover:text-white transition-colors"><i className="fas fa-plus"></i></button>
-                   <input type="text" value={messageInput} onChange={e=>setMessageInput(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'&&messageInput.trim()){ broadcastData({type:'chat',text:messageInput,sender:peerId||'',senderName:displayName}); setChatHistory(prev=>[...prev,{id:Date.now().toString(),sender:peerId||'',senderName:displayName,text:messageInput,timestamp:Date.now()}]); setMessageInput(''); }}} className="bg-transparent flex-1 focus:outline-none text-sm px-2 text-white" placeholder="Message..." />
+           <div className="p-3 bg-[#09090b]">
+               <div className="bg-[#18181b] rounded-full flex items-center p-1 border border-white/5">
+                   <button onClick={()=>mediaUploadRef.current?.click()} className="w-8 h-8 rounded-full bg-white/5 text-gray-400 hover:text-white flex items-center justify-center transition-colors"><i className="fas fa-plus text-xs"></i></button>
+                   <input type="text" value={messageInput} onChange={e=>setMessageInput(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'&&messageInput.trim()){ broadcastData({type:'chat',text:messageInput,sender:peerId||'',senderName:displayName}); setChatHistory(prev=>[...prev,{id:Date.now().toString(),sender:peerId||'',senderName:displayName,text:messageInput,timestamp:Date.now()}]); setMessageInput(''); }}} className="bg-transparent flex-1 focus:outline-none text-xs px-3 text-white" placeholder="Message..." />
                    <input type="file" ref={mediaUploadRef} className="hidden" onChange={(e)=>{const f=e.target.files?.[0]; if(f){const r=new FileReader(); r.onloadend=()=>{broadcastData({type:'file-share',file:r.result as string,fileName:f.name,fileType:f.type,sender:peerId||'',senderName:displayName}); setChatHistory(prev=>[...prev,{id:Date.now().toString(),sender:peerId||'',senderName:displayName,image:r.result as string,timestamp:Date.now()}]);}; r.readAsDataURL(f);}}} />
                </div>
            </div>
@@ -1067,16 +1315,16 @@ export default function App() {
 
        {/* Incoming Call Overlay */}
        {incomingCall && (
-           <div className="absolute inset-0 z-[60] bg-black/80 backdrop-blur-xl flex items-center justify-center animate-in fade-in">
+           <div className="absolute inset-0 z-[60] bg-black/80 backdrop-blur-sm flex items-center justify-center">
                <div className="text-center animate-bounce-slow">
-                   <div className="w-32 h-32 rounded-full bg-cyan-500 flex items-center justify-center text-4xl font-bold mb-6 shadow-[0_0_50px_rgba(6,182,212,0.5)] mx-auto">
+                   <div className="w-24 h-24 rounded-full bg-[#18181b] border border-white/10 flex items-center justify-center text-3xl font-bold mb-4 shadow-2xl mx-auto">
                        {getInitials(incomingCall.call.peer)}
                    </div>
-                   <h2 className="text-3xl font-bold mb-2">{incomingCall.metadata?.displayName || 'Inconnu'}</h2>
-                   <p className="text-gray-400 mb-8">veut rejoindre le Nexus...</p>
-                   <div className="flex space-x-6 justify-center">
-                       <button onClick={()=>setIncomingCall(null)} className="w-16 h-16 rounded-full bg-red-500/20 text-red-500 hover:bg-red-500 hover:text-white flex items-center justify-center text-2xl transition-all hover:scale-110"><i className="fas fa-times"></i></button>
-                       <button onClick={acceptCall} className="w-16 h-16 rounded-full bg-green-500/20 text-green-500 hover:bg-green-500 hover:text-white flex items-center justify-center text-2xl transition-all hover:scale-110"><i className="fas fa-check"></i></button>
+                   <h2 className="text-xl font-bold mb-1">{incomingCall.metadata?.displayName || 'Inconnu'}</h2>
+                   <p className="text-gray-500 text-sm mb-8">Appel entrant...</p>
+                   <div className="flex space-x-4 justify-center">
+                       <button onClick={rejectCall} className="w-14 h-14 rounded-full bg-red-500 text-white flex items-center justify-center text-xl transition-transform hover:scale-110"><i className="fas fa-times"></i></button>
+                       <button onClick={acceptCall} className="w-14 h-14 rounded-full bg-green-500 text-white flex items-center justify-center text-xl transition-transform hover:scale-110"><i className="fas fa-check"></i></button>
                    </div>
                </div>
            </div>

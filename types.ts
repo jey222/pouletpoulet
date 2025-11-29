@@ -1,5 +1,4 @@
 
-
 // Defining PeerJS types manually since we are using CDN
 export interface PeerOptions {
   host?: string;
@@ -117,16 +116,26 @@ export interface DrawLine {
     isEraser: boolean;
 }
 
+export interface QueueItem {
+    id: string; // Unique ID for the queue item
+    videoId: string; // YouTube Video ID
+    title: string;
+    thumbnail: string;
+    addedBy: string; // Peer ID
+    addedByName: string;
+}
+
 export interface ActivityMessage {
   type: 'activity';
-  action: 'start' | 'stop' | 'sync-state' | 'draw' | 'clear' | 'new-page' | 'set-page';
+  action: 'start' | 'stop' | 'sync-state' | 'draw' | 'clear' | 'new-page' | 'set-page' | 'sync-request' | 'add-queue' | 'remove-queue' | 'play-queue' | 'update-queue';
   activityType: 'youtube' | 'whiteboard';
   data?: {
     // Youtube
     videoId?: string;
     playerState?: number;
     currentTime?: number;
-    timestamp?: number;
+    queueItem?: QueueItem;
+    queue?: QueueItem[];
     
     // Whiteboard
     drawData?: DrawLine;
