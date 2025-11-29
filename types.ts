@@ -60,7 +60,8 @@ export interface RemotePeer {
     videoEnabled: boolean;
     isScreenSharing: boolean;
   };
-  volume: number; // 0-1
+  currentActivity: 'none' | 'youtube' | 'whiteboard'; // What are they doing?
+  volume: number; // 0-1 (Local volume control)
   isSpeaking: boolean;
 }
 
@@ -80,6 +81,7 @@ export interface StatusMessage {
   deafened: boolean;
   videoEnabled: boolean;
   isScreenSharing: boolean;
+  currentActivity?: 'none' | 'youtube' | 'whiteboard';
 }
 
 export interface TextDataMessage {
@@ -104,20 +106,31 @@ export interface ProfileUpdateMessage {
   displayName?: string;
 }
 
+// Drawing Data Types
+export interface DrawLine {
+    prevX: number;
+    prevY: number;
+    x: number;
+    y: number;
+    color: string;
+    size: number;
+    isEraser: boolean;
+}
+
 export interface ActivityMessage {
   type: 'activity';
-  action: 'start' | 'stop' | 'sync-state' | 'play-music' | 'pause-music' | 'change-track';
-  activityType: 'youtube' | 'music';
+  action: 'start' | 'stop' | 'sync-state' | 'draw' | 'clear' | 'new-page' | 'set-page';
+  activityType: 'youtube' | 'whiteboard';
   data?: {
     // Youtube
     videoId?: string;
     playerState?: number;
     currentTime?: number;
-    // Music
-    trackIndex?: number;
-    isPlaying?: boolean;
-    
     timestamp?: number;
+    
+    // Whiteboard
+    drawData?: DrawLine;
+    pageIndex?: number;
   };
 }
 
