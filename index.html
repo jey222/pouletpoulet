@@ -4,33 +4,57 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>PeerCord - Discord Clone</title>
-    <!-- Tailwind CSS via CDN is fine for simplicity, though normally built via PostCSS in prod -->
+    <title>CosmosP2P - Next Gen Chat</title>
+    <!-- Tailwind CSS via CDN -->
     <script src="https://cdn.tailwindcss.com"></script>
-    <!-- FontAwesome for Discord-like icons -->
+    <!-- FontAwesome -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <!-- PeerJS CDN is kept to ensure compatibility with existing code logic -->
+    <!-- Google Fonts: Plus Jakarta Sans -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- PeerJS -->
     <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
-  <script type="importmap">
-{
-  "imports": {
-    "react/": "https://aistudiocdn.com/react@^19.2.0/",
-    "react": "https://aistudiocdn.com/react@^19.2.0",
-    "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.0/",
-    "vite": "https://aistudiocdn.com/vite@^7.2.4",
-    "@vitejs/plugin-react": "https://aistudiocdn.com/@vitejs/plugin-react@^5.1.1"
-  }
-}
-</script>
+    <script type="importmap">
+    {
+      "imports": {
+        "react/": "https://aistudiocdn.com/react@^19.2.0/",
+        "react": "https://aistudiocdn.com/react@^19.2.0",
+        "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.0/",
+        "vite": "https://aistudiocdn.com/vite@^7.2.4",
+        "@vitejs/plugin-react": "https://aistudiocdn.com/@vitejs/plugin-react@^5.1.1"
+      }
+    }
+    </script>
+    <style>
+      body {
+        font-family: 'Plus Jakarta Sans', sans-serif;
+      }
+      /* Custom Scrollbar for Glass Theme */
+      ::-webkit-scrollbar {
+        width: 6px;
+        height: 6px;
+      }
+      ::-webkit-scrollbar-track {
+        background: transparent;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: rgba(255, 255, 255, 0.1);
+        border-radius: 10px;
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background: rgba(255, 255, 255, 0.2);
+      }
+    </style>
 <link rel="stylesheet" href="/index.css">
 </head>
-  <body class="bg-[#202225] text-gray-100 antialiased overflow-hidden">
+  <body class="bg-[#0f172a] text-slate-200 antialiased overflow-hidden selection:bg-indigo-500/30">
     <div id="root"></div>
 
     <!-- Point d'entrée pour Vite -->
     <script type="module" src="/index.tsx"></script>
 
-    <!-- Système de Sons (Soundboard) -->
+    <!-- Système de Sons -->
     <audio id="sound-ringtone" loop preload="auto"></audio>
     <audio id="sound-join" preload="auto"></audio>
     <audio id="sound-leave" preload="auto"></audio>

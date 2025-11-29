@@ -127,7 +127,7 @@ export interface QueueItem {
 
 export interface ActivityMessage {
   type: 'activity';
-  action: 'start' | 'stop' | 'sync-state' | 'draw' | 'clear' | 'new-page' | 'set-page' | 'sync-request' | 'add-queue' | 'remove-queue' | 'play-queue' | 'update-queue';
+  action: 'start' | 'stop' | 'sync-state' | 'draw' | 'draw-batch' | 'clear' | 'new-page' | 'set-page' | 'sync-request' | 'add-queue' | 'remove-queue' | 'play-queue' | 'update-queue';
   activityType: 'youtube' | 'whiteboard';
   data?: {
     // Youtube
@@ -139,6 +139,7 @@ export interface ActivityMessage {
     
     // Whiteboard
     drawData?: DrawLine;
+    drawBatch?: DrawLine[]; // New optimization
     pageIndex?: number;
   };
 }
