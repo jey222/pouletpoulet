@@ -15,6 +15,7 @@ export interface DataConnection {
   close: () => void;
   peer: string;
   open: boolean;
+  metadata: any;
 }
 
 export interface MediaConnection {
@@ -24,13 +25,14 @@ export interface MediaConnection {
   peer: string;
   open: boolean;
   peerConnection: RTCPeerConnection;
+  metadata: any;
 }
 
 export interface PeerInstance {
   new (id?: string, options?: PeerOptions): PeerInstance;
   on: (event: string, cb: (data: any) => void) => void;
-  connect: (id: string) => DataConnection;
-  call: (id: string, stream: MediaStream) => MediaConnection;
+  connect: (id: string, options?: { metadata: any }) => DataConnection;
+  call: (id: string, stream: MediaStream, options?: { metadata: any }) => MediaConnection;
   destroy: () => void;
   id: string;
 }
@@ -45,6 +47,23 @@ declare global {
 }
 
 // App Logic Types
+export interface RemotePeer {
+  id: string; // The Peer ID
+  displayName: string;
+  avatar?: string;
+  stream?: MediaStream;
+  dataConn?: DataConnection;
+  mediaCall?: MediaConnection;
+  status: {
+    muted: boolean;
+    deafened: boolean;
+    videoEnabled: boolean;
+    isScreenSharing: boolean;
+  };
+  volume: number; // 0-1
+  isSpeaking: boolean;
+}
+
 export interface ChatMessage {
   id: string;
   sender: string;
@@ -102,7 +121,13 @@ export interface ActivityMessage {
   };
 }
 
-export type NetworkMessage = StatusMessage | TextDataMessage | ProfileUpdateMessage | ActivityMessage | FileDataMessage;
+// Sent by host to new joiners so they can connect to others
+export interface PeerListMessage {
+  type: 'peer-list';
+  peers: string[]; // List of other peer IDs in the room
+}
+
+export type NetworkMessage = StatusMessage | TextDataMessage | ProfileUpdateMessage | ActivityMessage | FileDataMessage | PeerListMessage;
 
 export interface LogEntry {
   id: number;
