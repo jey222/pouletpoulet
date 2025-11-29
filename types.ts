@@ -1,4 +1,5 @@
 
+
 // Defining PeerJS types manually since we are using CDN
 export interface PeerOptions {
   host?: string;
@@ -47,6 +48,7 @@ declare global {
 export interface ChatMessage {
   id: string;
   sender: string;
+  senderName?: string; // Display Name
   text?: string;
   image?: string; // Base64
   timestamp: number;
@@ -65,6 +67,7 @@ export interface TextDataMessage {
   type: 'chat';
   text: string;
   sender: string;
+  senderName: string;
 }
 
 export interface FileDataMessage {
@@ -73,11 +76,13 @@ export interface FileDataMessage {
   fileName: string;
   fileType: string;
   sender: string;
+  senderName: string;
 }
 
 export interface ProfileUpdateMessage {
   type: 'profile-update';
-  avatar: string; // Base64
+  avatar?: string; // Base64
+  displayName?: string;
 }
 
 export interface ActivityMessage {
@@ -104,4 +109,9 @@ export interface LogEntry {
   timestamp: string;
   message: string;
   type: 'info' | 'error' | 'success';
+}
+
+export interface DeviceInfo {
+    deviceId: string;
+    label: string;
 }

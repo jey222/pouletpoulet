@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { DataConnection, MediaConnection, PeerInstance, NetworkMessage, LogEntry, ChatMessage } from './types';
+import { DataConnection, MediaConnection, PeerInstance, NetworkMessage, LogEntry, ChatMessage, DeviceInfo } from './types';
 
 // --- Assets & Constants ---
 const SOUND_RINGTONE = "https://actions.google.com/sounds/v1/alarms/digital_watch_alarm.ogg"; 
@@ -31,7 +31,8 @@ export default function App() {
   // --- State ---
   
   // Login & Connection
-  const [username, setUsername] = useState('');
+  const [username, setUsername] = useState(''); // Technical ID base
+  const [displayName, setDisplayName] = useState(''); // Visible name
   const [peerId, setPeerId] = useState<string | null>(null);
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
@@ -39,6 +40,7 @@ export default function App() {
   
   const [remoteIdInput, setRemoteIdInput] = useState('');
   const [connectedPeerId, setConnectedPeerId] = useState<string | null>(null);
+  const [remoteDisplayName, setRemoteDisplayName] = useState<string | null>(null);
 
   // Call Handling
   const [incomingCall, setIncomingCall] = useState<{ call: MediaConnection, metadata?: any } | null>(null);
@@ -47,29 +49,41 @@ export default function App() {
 
   // Media & Status
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
+  const [processedStream, setProcessedStream] = useState<MediaStream | null>(null); // Stream sent to peer (with gain)
   const [isMuted, setIsMuted] = useState(false);
   const [isDeafened, setIsDeafened] = useState(false);
   const [isVideoEnabled, setIsVideoEnabled] = useState(false);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
   
-  // Volume Control (Local)
+  // Audio Settings State
+  const [inputDevices, setInputDevices] = useState<DeviceInfo[]>([]);
+  const [outputDevices, setOutputDevices] = useState<DeviceInfo[]>([]);
+  const [selectedMicId, setSelectedMicId] = useState<string>('');
+  const [selectedSpeakerId, setSelectedSpeakerId] = useState<string>('');
+  const [micGain, setMicGain] = useState(1); // 1 = 100%, 2 = 200%
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<'audio' | 'profile'>('audio');
+
+  // Volume Control (Remote)
   const [remoteVolume, setRemoteVolume] = useState(1); // 0 to 1
 
   // Context Menu State
   const [contextMenu, setContextMenu] = useState<{ x: number, y: number, target: 'remote' } | null>(null);
 
-  // Refs
+  // Refs for State in Callbacks
   const isMutedRef = useRef(isMuted);
   const isDeafenedRef = useRef(isDeafened);
   const isVideoEnabledRef = useRef(isVideoEnabled);
   const isScreenSharingRef = useRef(isScreenSharing);
   const wasVideoEnabledBeforeShareRef = useRef(false);
+  const displayNameRef = useRef(displayName);
 
   // Sync refs
   useEffect(() => { isMutedRef.current = isMuted; }, [isMuted]);
   useEffect(() => { isDeafenedRef.current = isDeafened; }, [isDeafened]);
   useEffect(() => { isVideoEnabledRef.current = isVideoEnabled; }, [isVideoEnabled]);
   useEffect(() => { isScreenSharingRef.current = isScreenSharing; }, [isScreenSharing]);
+  useEffect(() => { displayNameRef.current = displayName; }, [displayName]);
 
   // Remote Status
   const [remotePeerStatus, setRemotePeerStatus] = useState<{ 
@@ -128,9 +142,11 @@ export default function App() {
   const chatBottomRef = useRef<HTMLDivElement>(null);
   const mediaUploadRef = useRef<HTMLInputElement>(null);
 
-  // Audio Context Refs
+  // Audio Processing Refs
   const localAudioCtxRef = useRef<AudioContext | null>(null);
   const remoteAudioCtxRef = useRef<AudioContext | null>(null);
+  const gainNodeRef = useRef<GainNode | null>(null);
+  const audioDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(null);
   const animationFrameRef = useRef<number | null>(null);
 
   // --- Scroll Chat ---
@@ -156,7 +172,113 @@ export default function App() {
     }
   }, [musicState, activity]);
 
-  // --- VIDEO REF CALLBACKS (Fix Black Screen) ---
+  // --- DEVICE & AUDIO MANAGEMENT ---
+
+  const loadDevices = async () => {
+      try {
+          const devices = await navigator.mediaDevices.enumerateDevices();
+          const inputs = devices.filter(d => d.kind === 'audioinput').map(d => ({ deviceId: d.deviceId, label: d.label || `Microphone ${d.deviceId.slice(0,5)}...` }));
+          const outputs = devices.filter(d => d.kind === 'audiooutput').map(d => ({ deviceId: d.deviceId, label: d.label || `Speaker ${d.deviceId.slice(0,5)}...` }));
+          setInputDevices(inputs);
+          setOutputDevices(outputs);
+          
+          if (!selectedMicId && inputs.length > 0) setSelectedMicId(inputs[0].deviceId);
+          if (!selectedSpeakerId && outputs.length > 0) setSelectedSpeakerId(outputs[0].deviceId);
+      } catch (e) { console.error("Error loading devices", e); }
+  };
+
+  const changeAudioInput = async (deviceId: string) => {
+      setSelectedMicId(deviceId);
+      try {
+          const newStream = await navigator.mediaDevices.getUserMedia({ 
+              audio: { deviceId: { exact: deviceId } },
+              video: isVideoEnabled 
+          });
+          
+          // Preserve Video Track if it exists in current localStream
+          if (localStream && localStream.getVideoTracks().length > 0) {
+              const videoTrack = localStream.getVideoTracks()[0];
+              newStream.addTrack(videoTrack);
+          }
+
+          setLocalStream(newStream);
+          
+          // Re-setup Audio Graph for Gain
+          const processed = setupAudioGraph(newStream);
+
+          // Replace Track in Active Call
+          if (mediaCallRef.current && mediaCallRef.current.peerConnection) {
+               const audioSender = mediaCallRef.current.peerConnection.getSenders().find((s: any) => s.track && s.track.kind === 'audio');
+               if (audioSender) {
+                   const processedAudioTrack = processed.getAudioTracks()[0];
+                   audioSender.replaceTrack(processedAudioTrack);
+               }
+          }
+      } catch (e) { addLog("Erreur changement micro", "error"); }
+  };
+
+  const changeAudioOutput = async (deviceId: string) => {
+      setSelectedSpeakerId(deviceId);
+      if (remoteVideoRef.current && 'setSinkId' in remoteVideoRef.current) {
+          try {
+              // @ts-ignore
+              await remoteVideoRef.current.setSinkId(deviceId);
+              // Also sync sound effects
+              const audioElements = document.getElementsByTagName('audio');
+              for (let i = 0; i < audioElements.length; i++) {
+                  // @ts-ignore
+                  if ('setSinkId' in audioElements[i]) await audioElements[i].setSinkId(deviceId);
+              }
+          } catch(e) { console.error("Output change error", e); }
+      }
+  };
+
+  const setupAudioGraph = (stream: MediaStream): MediaStream => {
+      if (!stream.getAudioTracks().length) return stream;
+
+      const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
+      if (!localAudioCtxRef.current) localAudioCtxRef.current = new AudioContext();
+      const ctx = localAudioCtxRef.current;
+      if(ctx.state === 'suspended') ctx.resume();
+
+      const source = ctx.createMediaStreamSource(stream);
+      const gainNode = ctx.createGain();
+      gainNode.gain.value = micGain;
+      gainNodeRef.current = gainNode;
+
+      const dest = ctx.createMediaStreamDestination();
+      audioDestinationRef.current = dest;
+
+      source.connect(gainNode);
+      gainNode.connect(dest);
+
+      // Combine processed audio with original video
+      const newStream = dest.stream;
+      stream.getVideoTracks().forEach(track => newStream.addTrack(track));
+      
+      setProcessedStream(newStream);
+      return newStream;
+  };
+
+  useEffect(() => {
+      if (gainNodeRef.current) {
+          gainNodeRef.current.gain.value = micGain;
+      }
+  }, [micGain]);
+
+  const updateDisplayName = () => {
+     if (displayName.trim()) {
+         if (dataConnRef.current && dataConnRef.current.open) {
+             dataConnRef.current.send({ 
+                 type: 'profile-update', 
+                 displayName: displayName 
+             });
+         }
+         addLog("Pseudo mis à jour !", "success");
+     }
+  };
+
+  // --- VIDEO REF CALLBACKS ---
   const setLocalVideoElement = useCallback((node: HTMLVideoElement | null) => {
     localVideoRef.current = node;
     if (node && localStream) {
@@ -171,8 +293,12 @@ export default function App() {
       node.srcObject = remoteStream;
       node.volume = remoteVolume;
       node.muted = isDeafened;
+      if (selectedSpeakerId && 'setSinkId' in node) {
+          // @ts-ignore
+          node.setSinkId(selectedSpeakerId).catch(e => {});
+      }
     }
-  }, [remoteStream, remoteVolume, isDeafened]);
+  }, [remoteStream, remoteVolume, isDeafened, selectedSpeakerId]);
 
   // --- Helpers ---
 
@@ -195,6 +321,10 @@ export default function App() {
     if (audioEl) {
       if (soundId === 'sound-ringtone' && !audioEl.src) {
         audioEl.src = SOUND_RINGTONE; 
+      }
+      if (selectedSpeakerId && 'setSinkId' in audioEl) {
+           // @ts-ignore
+           audioEl.setSinkId(selectedSpeakerId).catch(() => {});
       }
       audioEl.currentTime = 0;
       audioEl.play().catch(e => {}); 
@@ -228,17 +358,16 @@ export default function App() {
       const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
       if (!AudioContext) return;
       
-      if (isLocal && localAudioCtxRef.current) localAudioCtxRef.current.close();
-      if (!isLocal && remoteAudioCtxRef.current) remoteAudioCtxRef.current.close();
-
-      const audioCtx = new AudioContext();
-      // FIX: Force Resume to ensure browser doesn't suspend context
-      if (audioCtx.state === 'suspended') {
-        await audioCtx.resume();
+      // We re-use localAudioCtxRef if it exists, otherwise create new
+      let audioCtx = isLocal ? localAudioCtxRef.current : remoteAudioCtxRef.current;
+      
+      if (!audioCtx) {
+          audioCtx = new AudioContext();
+          if (isLocal) localAudioCtxRef.current = audioCtx;
+          else remoteAudioCtxRef.current = audioCtx;
       }
-
-      if (isLocal) localAudioCtxRef.current = audioCtx;
-      else remoteAudioCtxRef.current = audioCtx;
+      
+      if (audioCtx.state === 'suspended') await audioCtx.resume();
 
       const analyser = audioCtx.createAnalyser();
       analyser.fftSize = 256;
@@ -263,17 +392,17 @@ export default function App() {
   };
 
   const stopAudioAnalyzers = () => {
-    if (localAudioCtxRef.current) { localAudioCtxRef.current.close(); localAudioCtxRef.current = null; }
     if (remoteAudioCtxRef.current) { remoteAudioCtxRef.current.close(); remoteAudioCtxRef.current = null; }
     if (animationFrameRef.current) { cancelAnimationFrame(animationFrameRef.current); animationFrameRef.current = null; }
-    setIsLocalSpeaking(false); setIsRemoteSpeaking(false);
+    setIsRemoteSpeaking(false);
+    // Note: We don't close localAudioCtxRef here because we might need it for Gain control
   };
 
   // --- Logic: Features ---
 
   const toggleMute = () => {
-    if (!localStream) return;
-    const audioTrack = localStream.getAudioTracks()[0];
+    if (!processedStream) return; // Use processed stream
+    const audioTrack = processedStream.getAudioTracks()[0];
     if (audioTrack) {
       const newMutedState = !isMuted;
       audioTrack.enabled = !newMutedState;
@@ -285,12 +414,9 @@ export default function App() {
 
   const toggleDeafen = () => {
     const newDeafenState = !isDeafened;
-    
-    // Toggle remote video audio
     if (remoteVideoRef.current) {
       remoteVideoRef.current.muted = newDeafenState;
     }
-    
     setIsDeafened(newDeafenState);
     playSound(newDeafenState ? 'sound-mute' : 'sound-unmute');
     sendStatusUpdate({ deafened: newDeafenState });
@@ -341,19 +467,15 @@ export default function App() {
 
   const stopScreenShare = async () => {
     try {
-      // Re-acquire camera stream to ensure we have a fresh track
-      const camStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      const camStream = await navigator.mediaDevices.getUserMedia({ 
+          video: true, 
+          audio: { deviceId: selectedMicId ? { exact: selectedMicId } : undefined }
+      });
       const camTrack = camStream.getVideoTracks()[0];
-      const audioTrack = camStream.getAudioTracks()[0];
       
-      // Preserve mute state
-      audioTrack.enabled = !isMuted;
-
       if (mediaCallRef.current && mediaCallRef.current.peerConnection) {
         const sender = mediaCallRef.current.peerConnection.getSenders().find((s: any) => s.track && s.track.kind === 'video');
         if (sender) await sender.replaceTrack(camTrack);
-        const audioSender = mediaCallRef.current.peerConnection.getSenders().find((s: any) => s.track && s.track.kind === 'audio');
-        if (audioSender) await audioSender.replaceTrack(audioTrack);
       }
 
       setLocalStream(camStream);
@@ -377,7 +499,7 @@ export default function App() {
         const base64String = reader.result as string;
         setLocalAvatar(base64String);
         if (dataConnRef.current && dataConnRef.current.open) {
-          dataConnRef.current.send({ type: 'profile-update', avatar: base64String });
+          dataConnRef.current.send({ type: 'profile-update', avatar: base64String, displayName: displayName });
         }
       };
       reader.readAsDataURL(file);
@@ -399,12 +521,14 @@ export default function App() {
                 file: base64,
                 fileName: file.name,
                 fileType: file.type,
-                sender: peerId || 'Moi'
+                sender: peerId || 'Moi',
+                senderName: displayName
             };
             dataConnRef.current?.send(msg);
             setChatHistory(prev => [...prev, {
                 id: Date.now().toString(),
                 sender: 'Moi',
+                senderName: displayName,
                 image: base64,
                 timestamp: Date.now()
             }]);
@@ -426,125 +550,70 @@ export default function App() {
   };
 
   // --- Activities (WatchTogether & Music) ---
-
+  // ... (Code same as before, simplified for brevity here, logic unchanged) ...
   const initYouTubePlayer = (videoId: string) => {
     loadYouTubeAPI(() => {
-      if (playerRef.current) {
-        try { playerRef.current.destroy(); } catch(e) {}
-      }
+      if (playerRef.current) { try { playerRef.current.destroy(); } catch(e) {} }
       playerRef.current = new window.YT.Player('youtube-player', {
-        height: '100%',
-        width: '100%',
-        videoId: videoId,
+        height: '100%', width: '100%', videoId: videoId,
         playerVars: { 'playsinline': 1, 'controls': 1, 'disablekb': 0, 'rel': 0 },
         events: { 'onReady': onPlayerReady, 'onStateChange': onPlayerStateChange }
       });
     });
   };
-
   const onPlayerReady = (event: any) => {};
-
   const onPlayerStateChange = (event: any) => {
       if (isRemoteUpdateRef.current) return;
       const playerState = event.data;
       const currentTime = playerRef.current.getCurrentTime();
-
       if (playerState === 1 || playerState === 2) {
           if (dataConnRef.current) {
               dataConnRef.current.send({
-                  type: 'activity',
-                  action: 'sync-state',
-                  activityType: 'youtube',
+                  type: 'activity', action: 'sync-state', activityType: 'youtube',
                   data: { playerState, currentTime, timestamp: Date.now() }
               });
           }
       }
   };
-
   const startYoutubeActivity = () => {
     setYoutubeError(null);
     if (!youtubeInput) return;
     const regExp = /^(?:https?:\/\/)?(?:www\.)?(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=))([^#&?]*).*/;
     const match = youtubeInput.match(regExp);
-    
-    let videoId = "";
     if (match && match[1].length === 11) {
-        videoId = match[1];
-    } else {
-        setYoutubeError("Lien YouTube invalide.");
-        return;
-    }
-
-    const activityData = { type: 'youtube', videoId } as const;
-    setActivity(activityData);
-    setPinnedView('activity'); 
-    setShowActivityModal(false);
-    setYoutubeInput('');
-
-    if (dataConnRef.current) {
-        dataConnRef.current.send({ type: 'activity', action: 'start', activityType: 'youtube', data: { videoId } });
-    }
-    setTimeout(() => initYouTubePlayer(videoId), 100);
+        const videoId = match[1];
+        const activityData = { type: 'youtube', videoId } as const;
+        setActivity(activityData); setPinnedView('activity'); setShowActivityModal(false); setYoutubeInput('');
+        if (dataConnRef.current) dataConnRef.current.send({ type: 'activity', action: 'start', activityType: 'youtube', data: { videoId } });
+        setTimeout(() => initYouTubePlayer(videoId), 100);
+    } else { setYoutubeError("Lien YouTube invalide."); }
   };
-
-  // --- Music Logic ---
 
   const startMusicActivity = () => {
-      const activityData = { type: 'music' } as const;
-      setActivity(activityData);
-      setPinnedView('activity');
-      setShowActivityModal(false);
-      setMusicState({ isPlaying: true, trackIndex: 0 });
-
-      if (dataConnRef.current) {
-          dataConnRef.current.send({ type: 'activity', action: 'start', activityType: 'music' });
-      }
+      setActivity({ type: 'music' } as const); setPinnedView('activity'); setShowActivityModal(false); setMusicState({ isPlaying: true, trackIndex: 0 });
+      if (dataConnRef.current) dataConnRef.current.send({ type: 'activity', action: 'start', activityType: 'music' });
   };
-
   const handleMusicControl = (action: 'play' | 'pause' | 'next' | 'prev') => {
       let newState = { ...musicState };
       let netAction = '';
-
       if (action === 'play') { newState.isPlaying = true; netAction = 'play-music'; }
       if (action === 'pause') { newState.isPlaying = false; netAction = 'pause-music'; }
-      if (action === 'next') { 
-          newState.trackIndex = (newState.trackIndex + 1) % MUSIC_PLAYLIST.length; 
-          newState.isPlaying = true; 
-          netAction = 'change-track';
-      }
-      if (action === 'prev') { 
-          newState.trackIndex = (newState.trackIndex - 1 + MUSIC_PLAYLIST.length) % MUSIC_PLAYLIST.length; 
-          newState.isPlaying = true; 
-          netAction = 'change-track';
-      }
-
+      if (action === 'next') { newState.trackIndex = (newState.trackIndex + 1) % MUSIC_PLAYLIST.length; newState.isPlaying = true; netAction = 'change-track'; }
+      if (action === 'prev') { newState.trackIndex = (newState.trackIndex - 1 + MUSIC_PLAYLIST.length) % MUSIC_PLAYLIST.length; newState.isPlaying = true; netAction = 'change-track'; }
       setMusicState(newState);
-      if (dataConnRef.current) {
-          dataConnRef.current.send({ 
-              type: 'activity', 
-              action: netAction, 
-              activityType: 'music', 
-              data: { trackIndex: newState.trackIndex } 
-          });
-      }
+      if (dataConnRef.current) dataConnRef.current.send({ type: 'activity', action: netAction, activityType: 'music', data: { trackIndex: newState.trackIndex } });
   };
-
   const stopActivity = () => {
-    setActivity(null);
-    setPinnedView(null);
+    setActivity(null); setPinnedView(null);
     if (playerRef.current) { try { playerRef.current.destroy(); } catch(e){} playerRef.current = null; }
-    if (dataConnRef.current) {
-        dataConnRef.current.send({ type: 'activity', action: 'stop', activityType: 'youtube' }); // generic stop
-    }
+    if (dataConnRef.current) dataConnRef.current.send({ type: 'activity', action: 'stop', activityType: 'youtube' });
   };
 
-  // --- Volume Control ---
+  // --- Volume Control (Remote) ---
   const handleVolumeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
       const vol = parseFloat(e.target.value);
       setRemoteVolume(vol);
-      if (remoteVideoRef.current) {
-          remoteVideoRef.current.volume = vol;
-      }
+      if (remoteVideoRef.current) remoteVideoRef.current.volume = vol;
   };
 
   // --- Call Control ---
@@ -560,6 +629,7 @@ export default function App() {
     setIsCallActive(false);
     setRemotePeerStatus({ muted: false, deafened: false, videoEnabled: false, isScreenSharing: false });
     setRemoteAvatar(null);
+    setRemoteDisplayName(null);
     setRemoteStream(null);
     setActivity(null);
     setPinnedView(null);
@@ -577,12 +647,14 @@ export default function App() {
     const msg: NetworkMessage = {
       type: 'chat',
       text: messageInput,
-      sender: peerId || 'Moi'
+      sender: peerId || 'Moi',
+      senderName: displayName
     };
     dataConnRef.current.send(msg);
     setChatHistory(prev => [...prev, {
       id: Date.now().toString(),
       sender: 'Moi',
+      senderName: displayName,
       text: messageInput,
       timestamp: Date.now()
     }]);
@@ -611,7 +683,12 @@ export default function App() {
         videoEnabled: isVideoEnabledRef.current,
         isScreenSharing: isScreenSharingRef.current
       });
-      if (localAvatarRef.current) conn.send({ type: 'profile-update', avatar: localAvatarRef.current });
+      // Send Profile Info
+      conn.send({ 
+          type: 'profile-update', 
+          avatar: localAvatarRef.current,
+          displayName: displayNameRef.current
+      });
     });
 
     conn.on('data', (data: NetworkMessage) => {
@@ -626,14 +703,15 @@ export default function App() {
       } 
       else if (data.type === 'chat') {
         playSound('sound-message');
-        setChatHistory(prev => [...prev, { id: Date.now().toString(), sender: data.sender, text: data.text, timestamp: Date.now() }]);
+        setChatHistory(prev => [...prev, { id: Date.now().toString(), sender: data.sender, senderName: data.senderName, text: data.text, timestamp: Date.now() }]);
       }
       else if (data.type === 'file-share') {
         playSound('sound-message');
-        setChatHistory(prev => [...prev, { id: Date.now().toString(), sender: data.sender, image: data.file, timestamp: Date.now() }]);
+        setChatHistory(prev => [...prev, { id: Date.now().toString(), sender: data.sender, senderName: data.senderName, image: data.file, timestamp: Date.now() }]);
       }
       else if (data.type === 'profile-update') {
-        setRemoteAvatar(data.avatar);
+        if(data.avatar) setRemoteAvatar(data.avatar);
+        if(data.displayName) setRemoteDisplayName(data.displayName);
       }
       else if (data.type === 'activity') {
           if (data.action === 'start') {
@@ -641,20 +719,19 @@ export default function App() {
                 setActivity({ type: 'youtube', videoId: data.data.videoId });
                 setPinnedView('activity');
                 setTimeout(() => initYouTubePlayer(data.data!.videoId!), 100);
-                addLog(`${conn.peer} a lancé une vidéo YouTube`, 'info');
+                addLog(`L'ami a lancé une vidéo YouTube`, 'info');
              } else if (data.activityType === 'music') {
                 setActivity({ type: 'music' });
                 setPinnedView('activity');
                 setMusicState({ isPlaying: true, trackIndex: 0 });
-                addLog(`${conn.peer} a lancé PeerRadio`, 'info');
+                addLog(`L'ami a lancé PeerRadio`, 'info');
              }
           } 
           else if (data.action === 'stop') {
-              setActivity(null);
-              setPinnedView(null);
+              setActivity(null); setPinnedView(null);
               if (playerRef.current) { try { playerRef.current.destroy(); } catch(e){} playerRef.current = null; }
           }
-          // Sync Logic
+          // Sync Logic... (same as before)
           else if (data.activityType === 'youtube' && data.action === 'sync-state' && playerRef.current && data.data) {
               isRemoteUpdateRef.current = true;
               const { playerState, currentTime } = data.data;
@@ -704,8 +781,12 @@ export default function App() {
     stopRingtone();
     const call = incomingCall.call;
     addLog(`Appel accepté`, 'success');
-    call.answer(localStream);
-    startStream(call, localStream);
+    
+    // Create Processed Stream (with Gain) if not existing
+    const streamToSend = processedStream || setupAudioGraph(localStream);
+    
+    call.answer(streamToSend);
+    startStream(call, streamToSend);
     setIncomingCall(null);
     setConnectedPeerId(call.peer);
   };
@@ -727,11 +808,15 @@ export default function App() {
     const cleanUser = username.replace(/[^a-zA-Z0-9_-]/g, '');
     const myId = `${cleanUser}-${Math.floor(Math.random() * 9000) + 1000}`;
     setPeerId(myId);
+    setDisplayName(username); // Init Display Name
 
     try {
+      await loadDevices(); // Load Audio Devices list
+
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       setLocalStream(stream);
-      
+      const processed = setupAudioGraph(stream); // Setup gain
+
       // Init: Video OFF
       stream.getVideoTracks().forEach(track => track.enabled = false);
       setIsVideoEnabled(false);
@@ -782,8 +867,10 @@ export default function App() {
         return;
     }
     setupDataConnection(conn);
-    const call = peerRef.current.call(remoteIdInput, localStream);
-    startStream(call, localStream);
+    // Use Processed Stream (with Gain)
+    const streamToSend = processedStream || setupAudioGraph(localStream);
+    const call = peerRef.current.call(remoteIdInput, streamToSend);
+    startStream(call, streamToSend);
   };
 
   // --- LAYOUT RENDERING ---
@@ -799,7 +886,7 @@ export default function App() {
     const isSharing = isLocal ? isScreenSharing : remotePeerStatus.isScreenSharing;
     const avatar = isLocal ? localAvatar : remoteAvatar;
     const speaking = isLocal ? isLocalSpeaking : isRemoteSpeaking;
-    const id = isLocal ? (peerId || 'Moi') : (connectedPeerId || 'Invité');
+    const id = isLocal ? (displayName || username) : (remoteDisplayName || connectedPeerId?.split('-')[0] || 'Invité');
     const muted = isLocal ? isMuted : remotePeerStatus.muted;
     const deafened = isLocal ? isDeafened : remotePeerStatus.deafened;
 
@@ -848,7 +935,7 @@ export default function App() {
         
         {/* Name Tag */}
         <div className="absolute bottom-3 left-3 bg-black/60 px-2 py-1 rounded text-white text-xs font-bold backdrop-blur-md flex items-center z-30 pointer-events-none select-none border border-white/5">
-          {isLocal ? username : id.split('-')[0]}
+          {id}
           {muted && <i className="fas fa-microphone-slash text-[#ED4245] ml-2"></i>}
           {deafened && <i className="fas fa-headphones text-[#ED4245] ml-2"></i>}
         </div>
@@ -896,7 +983,77 @@ export default function App() {
       {/* Hidden Audio Player for Music */}
       <audio ref={audioPlayerRef} src={MUSIC_PLAYLIST[musicState.trackIndex]?.src} loop={false} onEnded={() => handleMusicControl('next')}></audio>
 
-      {/* Context Menu */}
+      {/* Settings Modal */}
+      {showSettingsModal && (
+          <div className="fixed inset-0 z-[100] bg-black/60 flex items-center justify-center backdrop-blur-sm" onClick={() => setShowSettingsModal(false)}>
+              <div className="bg-[#313338] w-full max-w-lg rounded-xl overflow-hidden shadow-2xl flex flex-col h-[500px]" onClick={e => e.stopPropagation()}>
+                  <div className="p-6 flex-1 flex flex-col">
+                      <h2 className="text-xl font-bold text-white mb-6">Paramètres</h2>
+                      
+                      <div className="flex space-x-6 mb-6 border-b border-[#3f4147] pb-1">
+                          <button onClick={() => setSettingsTab('audio')} className={`pb-2 font-medium text-sm ${settingsTab === 'audio' ? 'text-white border-b-2 border-[#5865F2]' : 'text-[#b9bbbe] hover:text-[#dbdee1]'}`}>Voix & Vidéo</button>
+                          <button onClick={() => setSettingsTab('profile')} className={`pb-2 font-medium text-sm ${settingsTab === 'profile' ? 'text-white border-b-2 border-[#5865F2]' : 'text-[#b9bbbe] hover:text-[#dbdee1]'}`}>Mon Compte</button>
+                      </div>
+
+                      {settingsTab === 'audio' && (
+                          <div className="space-y-6 overflow-y-auto pr-2 custom-scrollbar">
+                              <div>
+                                  <label className="block text-[#b9bbbe] text-xs font-bold uppercase mb-2">Périphérique d'entrée</label>
+                                  <select value={selectedMicId} onChange={(e) => changeAudioInput(e.target.value)} className="w-full bg-[#1e1f22] text-[#dbdee1] p-2.5 rounded text-sm border border-transparent focus:border-[#5865F2] outline-none">
+                                      {inputDevices.map(d => <option key={d.deviceId} value={d.deviceId}>{d.label}</option>)}
+                                  </select>
+                              </div>
+                              <div>
+                                  <label className="block text-[#b9bbbe] text-xs font-bold uppercase mb-2">Périphérique de sortie</label>
+                                  <select value={selectedSpeakerId} onChange={(e) => changeAudioOutput(e.target.value)} className="w-full bg-[#1e1f22] text-[#dbdee1] p-2.5 rounded text-sm border border-transparent focus:border-[#5865F2] outline-none">
+                                      {outputDevices.map(d => <option key={d.deviceId} value={d.deviceId}>{d.label}</option>)}
+                                  </select>
+                              </div>
+                              
+                              <div className="bg-[#2b2d31] p-4 rounded">
+                                  <label className="block text-[#b9bbbe] text-xs font-bold uppercase mb-3">Volume Entrée (Gain)</label>
+                                  <input type="range" min="0" max="2" step="0.1" value={micGain} onChange={(e) => setMicGain(parseFloat(e.target.value))} 
+                                      className="w-full accent-[#5865F2] h-2 bg-[#40444b] rounded-lg appearance-none cursor-pointer" 
+                                  />
+                                  <div className="flex justify-between text-[10px] text-[#b9bbbe] mt-1"><span>0%</span><span>100% (Défaut)</span><span>200%</span></div>
+                              </div>
+                          </div>
+                      )}
+
+                      {settingsTab === 'profile' && (
+                          <div className="space-y-6">
+                              <div className="flex items-center space-x-4 bg-[#2b2d31] p-4 rounded">
+                                  <div onClick={() => fileInputRef.current?.click()} className="w-20 h-20 rounded-full bg-[#5865F2] flex items-center justify-center overflow-hidden cursor-pointer hover:opacity-80 relative group">
+                                      {localAvatar ? <img src={localAvatar} className="w-full h-full object-cover" /> : <span className="text-2xl text-white font-bold">{getInitials(displayName || username)}</span>}
+                                      <div className="absolute inset-0 bg-black/40 hidden group-hover:flex items-center justify-center text-xs font-bold uppercase text-white">Edit</div>
+                                  </div>
+                                  <div>
+                                      <div className="text-xs font-bold text-[#b9bbbe] uppercase mb-1">Pseudo d'affichage</div>
+                                      <div className="text-white font-bold text-lg">{displayName || username}</div>
+                                      <div className="text-[#b9bbbe] text-xs">ID: {peerId}</div>
+                                  </div>
+                              </div>
+                              <div>
+                                  <label className="block text-[#b9bbbe] text-xs font-bold uppercase mb-2">Modifier Pseudo</label>
+                                  <input 
+                                      type="text" 
+                                      value={displayName} 
+                                      onChange={(e) => setDisplayName(e.target.value)} 
+                                      onBlur={updateDisplayName}
+                                      className="w-full bg-[#1e1f22] text-[#dbdee1] p-3 rounded border border-transparent focus:border-[#5865F2] outline-none"
+                                  />
+                              </div>
+                          </div>
+                      )}
+                  </div>
+                  <div className="bg-[#2b2d31] p-4 flex justify-end">
+                      <button onClick={() => setShowSettingsModal(false)} className="bg-[#5865F2] hover:bg-[#4752c4] text-white px-6 py-2 rounded font-medium text-sm transition-colors">Terminé</button>
+                  </div>
+              </div>
+          </div>
+      )}
+
+      {/* Context Menu (Remote Volume) */}
       {contextMenu && (
           <div 
              className="fixed z-[100] bg-[#111214] border border-[#1e1f22] w-56 rounded shadow-xl p-2 animate-in fade-in zoom-in-95 duration-100 origin-top-left"
@@ -1083,16 +1240,17 @@ export default function App() {
 
         {/* Control Bar */}
         <div className="h-16 bg-[#232428] flex items-center justify-center relative px-2 md:px-4 shrink-0 overflow-x-auto">
-           {/* User Info - Hidden on mobile to save space */}
-           <div className="hidden lg:flex absolute left-3 items-center p-1.5 rounded hover:bg-[#3f4147] cursor-pointer transition-colors group">
+           {/* User Info with Settings Trigger */}
+           <div className="hidden lg:flex absolute left-3 items-center p-1.5 rounded hover:bg-[#3f4147] cursor-pointer transition-colors group" onClick={() => setShowSettingsModal(true)}>
               <div className="w-8 h-8 rounded-full bg-[#5865F2] overflow-hidden relative">
-                 {localAvatar ? <img src={localAvatar} className="w-full h-full object-cover"/> : <div className="flex items-center justify-center h-full text-white font-bold text-xs">{getInitials(username)}</div>}
+                 {localAvatar ? <img src={localAvatar} className="w-full h-full object-cover"/> : <div className="flex items-center justify-center h-full text-white font-bold text-xs">{getInitials(displayName || username)}</div>}
                  <div className="absolute bottom-0 right-0 w-2.5 h-2.5 bg-[#23a559] rounded-full border-2 border-[#232428]"></div>
               </div>
               <div className="flex flex-col text-left ml-2">
-                 <span className="text-white text-xs font-bold leading-tight max-w-[100px] truncate">{username}</span>
+                 <span className="text-white text-xs font-bold leading-tight max-w-[100px] truncate">{displayName || username}</span>
                  <span className="text-[#b9bbbe] text-[10px]">#{peerId?.split('-')[1]}</span>
               </div>
+              <i className="fas fa-cog text-[#b9bbbe] ml-2 opacity-0 group-hover:opacity-100 transition-opacity text-xs"></i>
            </div>
 
            <div className="flex items-center space-x-2 md:space-x-3">
@@ -1105,6 +1263,11 @@ export default function App() {
                <ControlButton icon={isMuted ? "fa-microphone-slash" : "fa-microphone"} active={!isMuted} onClick={toggleMute} color={isMuted ? "red" : "white"} tooltip="Micro" />
                <ControlButton icon={isDeafened ? "fa-headphones" : "fa-headphones-simple"} active={!isDeafened} onClick={toggleDeafen} color={isDeafened ? "red" : "white"} tooltip="Casque" />
                
+               {/* Mobile Settings Button */}
+               <div className="md:hidden">
+                 <ControlButton icon="fa-cog" active={false} onClick={() => setShowSettingsModal(true)} color="white" tooltip="Paramètres" />
+               </div>
+
                <button onClick={endCall} className="w-10 h-10 rounded-full bg-[#ED4245] hover:bg-red-600 text-white flex items-center justify-center transition-all hover:scale-110 shadow-md ml-2">
                  <i className="fas fa-phone-slash text-sm"></i>
                </button>
@@ -1120,7 +1283,7 @@ export default function App() {
              ${showMobileChat ? 'flex' : 'hidden'}
         `}>
           <div className="h-12 flex items-center justify-between px-4 shadow-sm border-b border-[#1e1f22] shrink-0">
-            <h3 className="font-bold text-[#f2f3f5] text-xs uppercase tracking-wide truncate">Discussion avec {connectedPeerId.split('-')[0]}</h3>
+            <h3 className="font-bold text-[#f2f3f5] text-xs uppercase tracking-wide truncate">Discussion avec {remoteDisplayName || connectedPeerId.split('-')[0]}</h3>
             {/* Close button for mobile */}
             <button onClick={() => setShowMobileChat(false)} className="md:hidden text-[#b9bbbe] hover:text-white">
                 <i className="fas fa-times"></i>
@@ -1138,12 +1301,12 @@ export default function App() {
                <div key={msg.id} className="flex space-x-3 group animate-in fade-in slide-in-from-bottom-2 duration-200">
                   <div className="w-8 h-8 rounded-full bg-[#5865F2] flex-shrink-0 flex items-center justify-center text-xs font-bold text-white overflow-hidden mt-0.5 cursor-pointer hover:opacity-80 transition-opacity">
                      {msg.sender === 'Moi' && localAvatar ? <img src={localAvatar} className="object-cover w-full h-full"/> : 
-                      msg.sender !== 'Moi' && remoteAvatar ? <img src={remoteAvatar} className="object-cover w-full h-full"/> : getInitials(msg.sender)}
+                      msg.sender !== 'Moi' && remoteAvatar ? <img src={remoteAvatar} className="object-cover w-full h-full"/> : getInitials(msg.senderName || msg.sender)}
                   </div>
                   <div className="min-w-0 flex-1">
                      <div className="flex items-baseline space-x-2">
                         <span className={`font-medium text-sm cursor-pointer ${msg.sender === 'Moi' ? 'text-[#00aff4]' : 'text-[#f2f3f5]'}`}>
-                           {msg.sender === 'Moi' ? username : msg.sender.split('-')[0]}
+                           {msg.sender === 'Moi' ? (displayName || username) : (msg.senderName || msg.sender.split('-')[0])}
                         </span>
                         <span className="text-[10px] text-[#949BA4] font-medium">{new Date(msg.timestamp).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</span>
                      </div>
